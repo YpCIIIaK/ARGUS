@@ -19,7 +19,7 @@ const schema = z.object({
   CREATIVE_MODEL: z.string().optional(),
   RESEARCHER_MODEL: z.string().optional(),
   COORDINATOR_MODEL: z.string().optional(),
-  MAX_AGENT_REPLIES: z.coerce.number().int().min(1).max(10).default(4),
+  MAX_AGENT_REPLIES: z.coerce.number().int().min(1).max(10).default(5),
   MAX_CONTEXT_MESSAGES: z.coerce.number().int().min(4).max(100).default(20),
   DAILY_REQUEST_LIMIT: z.coerce.number().int().positive().default(100),
   AUTONOMOUS_ENABLED: booleanString,

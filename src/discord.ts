@@ -120,7 +120,12 @@ async function runDiscussion(message: Message, store: Store, selected: Agent[]) 
       await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: answer });
     } catch (error) {
       console.error(`${agent.name} failed`, error);
-      await message.reply(`Не удалось получить ответ агента «${agent.name}». Попробую снова при следующем сообщении.`);
+      try {
+        await message.reply(`Не удалось получить ответ агента «${agent.name}». Остальные агенты продолжат обсуждение.`);
+      } catch (notificationError) {
+        console.error("Failed to send agent error notification", notificationError);
+      }
+      continue;
     }
   }
 }
