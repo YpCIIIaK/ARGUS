@@ -40,6 +40,7 @@ export function createDiscordClient(store: Store) {
 
 function shouldHandle(message: Message, botId?: string) {
   if (!message.guild || !message.content.trim()) return false;
+  if (config.BOUNTY_CHANNEL_ID && message.channelId === config.BOUNTY_CHANNEL_ID) return false;
   if (message.author.bot || message.webhookId || message.author.id === botId) return false;
   if (config.allowedChannelIds.size && !config.allowedChannelIds.has(message.channelId)) return false;
   return message.channel.isTextBased() && !message.channel.isDMBased();
@@ -66,7 +67,11 @@ async function handleCommand(message: Message, store: Store) {
   const [rawCommand, ...rest] = message.content.slice(1).trim().split(/\s+/);
   const command = rawCommand?.toLowerCase();
   if (command === "agents") {
-    await message.reply(agents.map((a) => `${a.emoji} **${a.name}** — \`${a.model}\``).join("\n"));
+    const active = agents.map((a) => `${a.emoji} **${a.name}** — \`${a.model}\``).join("\n");
+    const bounty = config.BOUNTY_CHANNEL_ID
+      ? "\n🔭 **Bounty Monitor** — изолированный источник, доступен через `!bounty`"
+      : "";
+    await message.reply(active + bounty);
     return;
   }
   if (command === "status") {
@@ -80,6 +85,28 @@ async function handleCommand(message: Message, store: Store) {
     }
     await store.setPaused(command === "pause");
     await message.reply(command === "pause" ? "Агенты поставлены на паузу." : "Агенты снова активны.");
+    return;
+  }
+  if (command === "bounty") {
+    const bountyHistory = await readBountyChannel(message);
+    if (!bountyHistory.length) return;
+    const question = rest.join(" ").trim();
+    if (!question) {
+      const latest = bountyHistory[bountyHistory.length - 1]!.content;
+      await message.reply(`Последнее сообщение Bounty Monitor:\n\n${latest.slice(0, 1700)}`);
+      return;
+    }
+    if (await store.isPaused()) {
+      await message.reply("Агенты сейчас на паузе. Используй `!resume`.");
+      return;
+    }
+    await store.addMessage({
+      channelId: message.channelId,
+      discordMessageId: message.id,
+      author: message.member?.displayName || message.author.displayName,
+      content: `Вопрос по Bounty Monitor: ${question}`
+    });
+    await runDiscussion(message, store, agents, question, bountyHistory);
     return;
   }
   if (command === "discuss") {
@@ -96,7 +123,7 @@ async function handleCommand(message: Message, store: Store) {
     await runDiscussion(message, store, selectAgents(topic, true), topic);
     return;
   }
-  await message.reply("Команды: `!discuss <тема>`, `!agents`, `!status`, `!pause`, `!resume`.");
+  await message.reply("Команды: `!discuss <тема>`, `!bounty [вопрос]`, `!agents`, `!status`, `!pause`, `!resume`.");
 }
 
 function isController(message: Message) {
@@ -104,7 +131,13 @@ function isController(message: Message) {
   return message.member?.permissions.has(PermissionsBitField.Flags.Administrator) ?? false;
 }
 
-async function runDiscussion(message: Message, store: Store, selected: Agent[], currentRequest: string) {
+async function runDiscussion(
+  message: Message,
+  store: Store,
+  selected: Agent[],
+  currentRequest: string,
+  extraContext: Array<{ author: string; content: string }> = []
+) {
   const requestedLimit = requestedReplyLimit(currentRequest);
   const candidates = selected.slice(0, Math.min(config.MAX_AGENT_REPLIES, requestedLimit ?? selected.length));
   await (message.channel as TextChannel).sendTyping();
@@ -114,7 +147,10 @@ async function runDiscussion(message: Message, store: Store, selected: Agent[], 
       break;
     }
     try {
-      const context = await store.recent(message.channelId, config.MAX_CONTEXT_MESSAGES);
+      const context = [
+        ...(await store.recent(message.channelId, config.MAX_CONTEXT_MESSAGES)),
+        ...extraContext
+      ];
       const answer = await askAgent(agent, context, currentRequest);
       if (answer === "[PASS]" || answer.startsWith("[PASS]")) continue;
       const sent = await sendAsAgent(message.channel as TextChannel, agent, answer);
@@ -128,6 +164,29 @@ async function runDiscussion(message: Message, store: Store, selected: Agent[], 
       }
       continue;
     }
+  }
+}
+
+async function readBountyChannel(message: Message): Promise<Array<{ author: string; content: string }>> {
+  if (!config.BOUNTY_CHANNEL_ID) {
+    await message.reply("Канал Bounty Monitor ещё не настроен: добавь `BOUNTY_CHANNEL_ID` в Render Environment.");
+    return [];
+  }
+  try {
+    const channel = await message.client.channels.fetch(config.BOUNTY_CHANNEL_ID);
+    if (!channel || !channel.isTextBased() || channel.isDMBased()) {
+      await message.reply("Не удалось открыть настроенный канал Bounty Monitor.");
+      return [];
+    }
+    const messages = await channel.messages.fetch({ limit: 20 });
+    return [...messages.values()]
+      .filter((item) => item.content.trim())
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+      .map((item) => ({ author: "Bounty Monitor", content: item.content.trim() }));
+  } catch (error) {
+    console.error("Failed to read Bounty Monitor channel", error);
+    await message.reply("Не удалось прочитать канал Bounty Monitor. Проверь ID канала и права View Channel / Read Message History.");
+    return [];
   }
 }
 

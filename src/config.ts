@@ -13,6 +13,7 @@ const schema = z.object({
   PORT: z.coerce.number().int().positive().default(10000),
   ALLOWED_CHANNEL_IDS: z.string().default(""),
   OWNER_IDS: z.string().default(""),
+  BOUNTY_CHANNEL_ID: z.string().optional(),
   DEFAULT_MODEL: z.string().default("openrouter/auto"),
   PROGRAMMER_MODEL: z.string().optional(),
   ENGINEER_MODEL: z.string().optional(),
