@@ -8,6 +8,7 @@ import {
   WebhookClient
 } from "discord.js";
 import { agents, selectAgents, type Agent } from "./agents.js";
+import { formatBountyRun, getBountyStatus, startBountyScan } from "./bounty.js";
 import { config } from "./config.js";
 import { askAgent } from "./openrouter.js";
 import { Store } from "./store.js";
@@ -88,6 +89,32 @@ async function handleCommand(message: Message, store: Store) {
     return;
   }
   if (command === "bounty") {
+    const action = rest[0]?.toLowerCase();
+    if (action === "status") {
+      try {
+        const run = await getBountyStatus();
+        await message.reply(run ? formatBountyRun(run) : "Bounty Monitor доступен, но прогонов ещё не было.");
+      } catch (error) {
+        console.error("Failed to get Bounty Monitor status", error);
+        await message.reply(`Не удалось получить статус Bounty Monitor: ${errorMessage(error)}`);
+      }
+      return;
+    }
+    if (action === "scan" || action === "rescan") {
+      if (!isController(message)) {
+        await message.reply("Запуск Bounty Monitor доступен владельцам и администраторам сервера.");
+        return;
+      }
+      await message.reply("Запускаю Bounty Monitor. Полный прогон может занять до минуты…");
+      try {
+        const run = await startBountyScan();
+        await message.reply(`Скан завершён. Отчёт отправлен в bounty-канал.\n${formatBountyRun(run)}`);
+      } catch (error) {
+        console.error("Failed to start Bounty Monitor scan", error);
+        await message.reply(`Не удалось запустить Bounty Monitor: ${errorMessage(error)}`);
+      }
+      return;
+    }
     const bountyHistory = await readBountyChannel(message);
     if (!bountyHistory.length) return;
     const question = rest.join(" ").trim();
@@ -123,7 +150,7 @@ async function handleCommand(message: Message, store: Store) {
     await runDiscussion(message, store, selectAgents(topic, true), topic);
     return;
   }
-  await message.reply("Команды: `!discuss <тема>`, `!bounty [вопрос]`, `!agents`, `!status`, `!pause`, `!resume`.");
+  await message.reply("Команды: `!discuss <тема>`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!agents`, `!status`, `!pause`, `!resume`.");
 }
 
 function isController(message: Message) {
@@ -198,6 +225,10 @@ function requestedReplyLimit(text: string): number | null {
   if (/\b(?:нужен|дайте|дай|только)\s+(?:один|1)\s+(?:короткий\s+)?ответ\b/iu.test(text)) return 1;
   if (/\b(?:ответь|отвечает|пусть\s+ответит)\s+(?:только\s+)?(?:один|1)\s+агент\b/iu.test(text)) return 1;
   return null;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function sendAsAgent(channel: TextChannel, agent: Agent, content: string) {

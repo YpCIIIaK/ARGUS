@@ -14,6 +14,8 @@ const schema = z.object({
   ALLOWED_CHANNEL_IDS: z.string().default(""),
   OWNER_IDS: z.string().default(""),
   BOUNTY_CHANNEL_ID: z.string().optional(),
+  BOUNTY_MONITOR_URL: z.preprocess((value) => value === "" ? undefined : value, z.string().url().optional()),
+  BOUNTY_MONITOR_TOKEN: z.string().optional(),
   DEFAULT_MODEL: z.string().default("openrouter/auto"),
   PROGRAMMER_MODEL: z.string().optional(),
   ENGINEER_MODEL: z.string().optional(),

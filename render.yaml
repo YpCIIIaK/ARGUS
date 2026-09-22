@@ -15,6 +15,12 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: BOUNTY_CHANNEL_ID
+        sync: false
+      - key: BOUNTY_MONITOR_URL
+        sync: false
+      - key: BOUNTY_MONITOR_TOKEN
+        sync: false
       - key: DEFAULT_MODEL
         value: openrouter/auto
       - key: AUTONOMOUS_ENABLED
