@@ -59,7 +59,7 @@ async function handleMessage(message: Message, store: Store) {
     author: message.member?.displayName || message.author.displayName,
     content: text
   });
-  await runDiscussion(message, store, selectAgents(text));
+  await runDiscussion(message, store, selectAgents(text), text);
 }
 
 async function handleCommand(message: Message, store: Store) {
@@ -93,7 +93,7 @@ async function handleCommand(message: Message, store: Store) {
       return;
     }
     await store.addMessage({ channelId: message.channelId, discordMessageId: message.id, author: message.member?.displayName || message.author.displayName, content: topic });
-    await runDiscussion(message, store, selectAgents(topic, true));
+    await runDiscussion(message, store, selectAgents(topic, true), topic);
     return;
   }
   await message.reply("Команды: `!discuss <тема>`, `!agents`, `!status`, `!pause`, `!resume`.");
@@ -104,8 +104,9 @@ function isController(message: Message) {
   return message.member?.permissions.has(PermissionsBitField.Flags.Administrator) ?? false;
 }
 
-async function runDiscussion(message: Message, store: Store, selected: Agent[]) {
-  const candidates = selected.slice(0, config.MAX_AGENT_REPLIES);
+async function runDiscussion(message: Message, store: Store, selected: Agent[], currentRequest: string) {
+  const requestedLimit = requestedReplyLimit(currentRequest);
+  const candidates = selected.slice(0, Math.min(config.MAX_AGENT_REPLIES, requestedLimit ?? selected.length));
   await (message.channel as TextChannel).sendTyping();
   for (const agent of candidates) {
     if (!store.consumeRequest()) {
@@ -114,7 +115,7 @@ async function runDiscussion(message: Message, store: Store, selected: Agent[]) 
     }
     try {
       const context = await store.recent(message.channelId, config.MAX_CONTEXT_MESSAGES);
-      const answer = await askAgent(agent, context);
+      const answer = await askAgent(agent, context, currentRequest);
       if (answer === "[PASS]" || answer.startsWith("[PASS]")) continue;
       const sent = await sendAsAgent(message.channel as TextChannel, agent, answer);
       await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: answer });
@@ -128,6 +129,12 @@ async function runDiscussion(message: Message, store: Store, selected: Agent[]) 
       continue;
     }
   }
+}
+
+function requestedReplyLimit(text: string): number | null {
+  if (/\b(?:нужен|дайте|дай|только)\s+(?:один|1)\s+(?:короткий\s+)?ответ\b/iu.test(text)) return 1;
+  if (/\b(?:ответь|отвечает|пусть\s+ответит)\s+(?:только\s+)?(?:один|1)\s+агент\b/iu.test(text)) return 1;
+  return null;
 }
 
 async function sendAsAgent(channel: TextChannel, agent: Agent, content: string) {

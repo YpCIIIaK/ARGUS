@@ -23,7 +23,7 @@ function readText(content: string | Array<{ type?: string; text?: string }> | nu
   return "";
 }
 
-export async function askAgent(agent: Agent, context: ContextMessage[]): Promise<string> {
+export async function askAgent(agent: Agent, context: ContextMessage[], currentRequest: string): Promise<string> {
   const transcript = context.map((item) => `${item.author}: ${item.content}`).join("\n");
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -37,7 +37,10 @@ export async function askAgent(agent: Agent, context: ContextMessage[]): Promise
       model: agent.model,
       messages: [
         { role: "system", content: agent.prompt },
-        { role: "user", content: `Текущая переписка:\n${transcript}\n\nОтветь как ${agent.name}.` }
+        {
+          role: "user",
+          content: `ИСТОРИЯ ДЛЯ КОНТЕКСТА (может содержать старые завершённые темы):\n${transcript}\n\nАКТУАЛЬНЫЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n${currentRequest}\n\nВыполни именно актуальный запрос как ${agent.name}. Не продолжай старую тему, если пользователь прямо не попросил об этом. Соблюдай требуемые краткость и формат буквально.`
+        }
       ],
       temperature: agent.id === "creative" ? 0.9 : 0.55,
       max_tokens: 30_000,
