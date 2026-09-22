@@ -1,8 +1,17 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  ModalBuilder,
   PermissionsBitField,
+  StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  type Guild,
+  type Interaction,
   type Message,
   type TextChannel,
   WebhookClient
@@ -36,6 +45,17 @@ export function createDiscordClient(store: Store) {
     channelQueues.set(message.channelId, next);
   });
 
+  client.on("interactionCreate", (interaction) => {
+    void handleSettingsInteraction(interaction, store).catch(async (error) => {
+      console.error("Settings interaction failed", error);
+      const content = `Не удалось применить настройку: ${errorMessage(error)}`;
+      if (interaction.isRepliable()) {
+        if (interaction.replied || interaction.deferred) await interaction.followUp({ content, ephemeral: true }).catch(() => undefined);
+        else await interaction.reply({ content, ephemeral: true }).catch(() => undefined);
+      }
+    });
+  });
+
   return client;
 }
 
@@ -43,7 +63,8 @@ function shouldHandle(message: Message, botId?: string) {
   if (!message.guild || !message.content.trim()) return false;
   if (config.BOUNTY_CHANNEL_ID && message.channelId === config.BOUNTY_CHANNEL_ID) return false;
   if (message.author.bot || message.webhookId || message.author.id === botId) return false;
-  if (config.allowedChannelIds.size && !config.allowedChannelIds.has(message.channelId) && !agentForChannel(message)) return false;
+  if (isSettingsChannel(message) && !message.content.trim().startsWith(commandPrefix)) return false;
+  if (config.allowedChannelIds.size && !config.allowedChannelIds.has(message.channelId) && !agentForChannel(message) && !isSettingsChannel(message)) return false;
   return message.channel.isTextBased() && !message.channel.isDMBased();
 }
 
@@ -70,11 +91,25 @@ async function handleCommand(message: Message, store: Store) {
   const command = rawCommand?.toLowerCase();
   const channelAgent = agentForChannel(message);
   if (command === "agents") {
-    const active = agents.map((a) => `${a.emoji} **${a.name}** — \`${a.model}\` — #${a.channelName}`).join("\n");
+    const active = agents
+      .map((a) => `${a.emoji} **${a.name}** — \`${runtimeAgent(store, a).model}\` — #${a.channelName}`)
+      .join("\n");
     const bounty = config.BOUNTY_CHANNEL_ID
       ? "\n🔭 **Bounty Monitor** — изолированный источник, доступен через `!bounty`"
       : "";
     await message.reply(active + bounty);
+    return;
+  }
+  if (command === "settings" || command === "настройки") {
+    if (!isSettingsChannel(message)) {
+      await message.reply("Открой канал `#настройки-⚙` и вызови там `!settings`.");
+      return;
+    }
+    if (!isController(message)) {
+      await message.reply("Панель настроек доступна владельцам и администраторам сервера.");
+      return;
+    }
+    await message.reply(await buildSettingsPanel(store));
     return;
   }
   if (command === "status") {
@@ -98,7 +133,7 @@ async function handleCommand(message: Message, store: Store) {
       await message.reply("Открой персональный канал агента, чтобы посмотреть его модель.");
       return;
     }
-    await message.reply(`**${channelAgent.name}** использует модель \`${channelAgent.model}\`.`);
+    await message.reply(`**${channelAgent.name}** использует модель \`${runtimeAgent(store, channelAgent).model}\`.`);
     return;
   }
   if (command === "clear") {
@@ -130,14 +165,16 @@ async function handleCommand(message: Message, store: Store) {
     }
     await message.reply("Сжимаю текущий контекст в краткую сводку…");
     try {
+      const configuredAgent = runtimeAgent(store, channelAgent);
       const result = await askAgent(
-        channelAgent,
+        configuredAgent,
         context,
-        "Сожми историю этой сессии в самостоятельную рабочую сводку. Сохрани цели, решения, важные факты, ограничения и незавершённые задачи. Удали повторы и разговорный шум. Не добавляй новых сведений."
+        "Сожми историю этой сессии в самостоятельную рабочую сводку. Сохрани цели, решения, важные факты, ограничения и незавершённые задачи. Удали повторы и разговорный шум. Не добавляй новых сведений.",
+        store.getNumberSetting("max_output_tokens", 30_000)
       );
       await store.recordUsage({ channelId: message.channelId, agentId: channelAgent.id, model: result.model, ...result.usage });
       await store.replaceContext(message.channelId, "Сводка контекста", result.content);
-      await sendAsAgent(message.channel as TextChannel, channelAgent, `Контекст сжат:\n\n${result.content}`);
+      await sendAsAgent(message.channel as TextChannel, configuredAgent, `Контекст сжат:\n\n${result.content}`);
     } catch (error) {
       console.error("Context compaction failed", error);
       await message.reply(`Не удалось сжать контекст: ${errorMessage(error)}`);
@@ -146,7 +183,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "help") {
     await message.reply(
-      "Команды: `!discuss <тема>`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!agents`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
+      "Команды: `!discuss <тема>`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
     );
     return;
   }
@@ -237,7 +274,8 @@ async function runDiscussion(
   extraContext: Array<{ author: string; content: string }> = []
 ) {
   const requestedLimit = requestedReplyLimit(currentRequest);
-  const candidates = selected.slice(0, Math.min(config.MAX_AGENT_REPLIES, requestedLimit ?? selected.length));
+  const maxReplies = store.getNumberSetting("max_agent_replies", config.MAX_AGENT_REPLIES);
+  const candidates = selected.slice(0, Math.min(maxReplies, requestedLimit ?? selected.length));
   await (message.channel as TextChannel).sendTyping();
   for (const agent of candidates) {
     if (!store.consumeRequest()) {
@@ -245,14 +283,21 @@ async function runDiscussion(
       break;
     }
     try {
+      const configuredAgent = runtimeAgent(store, agent);
+      const contextLimit = store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES);
       const context = [
-        ...(await store.recent(message.channelId, config.MAX_CONTEXT_MESSAGES)),
+        ...(await store.recent(message.channelId, contextLimit)),
         ...extraContext
       ];
-      const result = await askAgent(agent, context, currentRequest);
+      const result = await askAgent(
+        configuredAgent,
+        context,
+        currentRequest,
+        store.getNumberSetting("max_output_tokens", 30_000)
+      );
       await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
       if (result.content === "[PASS]" || result.content.startsWith("[PASS]")) continue;
-      const sent = await sendAsAgent(message.channel as TextChannel, agent, result.content);
+      const sent = await sendAsAgent(message.channel as TextChannel, configuredAgent, result.content);
       await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: result.content });
     } catch (error) {
       console.error(`${agent.name} failed`, error);
@@ -310,17 +355,239 @@ function agentForChannel(message: Message): Agent | undefined {
   return agents.find((agent) => agent.channelName === channelName);
 }
 
+function runtimeAgent(store: Store, agent: Agent): Agent {
+  return { ...agent, model: store.getSetting(`agent_model:${agent.id}`) || agent.model };
+}
+
+function isSettingsChannel(message: Message): boolean {
+  const name = "name" in message.channel ? String(message.channel.name ?? "").toLowerCase() : "";
+  return name.startsWith("настройки") || name === "settings";
+}
+
+function isInteractionController(interaction: Interaction): boolean {
+  if (config.ownerIds.has(interaction.user.id)) return true;
+  return interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator) ?? false;
+}
+
+async function buildSettingsPanel(store: Store) {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId("settings:agent")
+    .setPlaceholder("Выбрать агента")
+    .addOptions(agents.map((agent) => ({
+      label: agent.name,
+      value: agent.id,
+      description: `${runtimeAgent(store, agent).model}`.slice(0, 100),
+      emoji: agent.emoji
+    })));
+  const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("settings:limits").setLabel("Общие лимиты").setEmoji("⚙️").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("settings:usage").setLabel("Использование").setEmoji("📊").setStyle(ButtonStyle.Secondary)
+  );
+  return {
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("⚙️ Настройки ARGUS")
+        .setDescription("Выбери агента, чтобы изменить его модель или контекст. Общие лимиты действуют на весь сервер.")
+        .setColor(0x5865f2)
+    ],
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select), buttons]
+  };
+}
+
+async function handleSettingsInteraction(interaction: Interaction, store: Store) {
+  if (!interaction.isStringSelectMenu() && !interaction.isButton() && !interaction.isModalSubmit()) return;
+  if (!interaction.customId.startsWith("settings:")) return;
+  if (!isInteractionController(interaction)) {
+    await interaction.reply({ content: "Настройки доступны владельцам и администраторам сервера.", ephemeral: true });
+    return;
+  }
+
+  if (interaction.isStringSelectMenu() && interaction.customId === "settings:agent") {
+    const agent = agents.find((item) => item.id === interaction.values[0]);
+    if (!agent || !interaction.guild) return;
+    await interaction.reply({ ...(await buildAgentSettings(store, interaction.guild, agent)), ephemeral: true });
+    return;
+  }
+
+  if (interaction.isButton() && interaction.customId === "settings:limits") {
+    await interaction.showModal(buildLimitsModal(store));
+    return;
+  }
+  if (interaction.isButton() && interaction.customId === "settings:usage") {
+    const lines = await Promise.all(agents.map(async (agent) => {
+      const channelId = interaction.guild ? findAgentChannelId(interaction.guild, agent) : undefined;
+      if (!channelId) return `${agent.emoji} **${agent.name}** — канал не найден`;
+      const stats = await store.usageStats(channelId);
+      return `${agent.emoji} **${agent.name}** — ${stats.allTime.requests} запросов · ${stats.allTime.totalTokens.toLocaleString("ru-RU")} токенов · $${stats.allTime.costUsd.toFixed(6)}`;
+    }));
+    await interaction.reply({ content: lines.join("\n"), ephemeral: true });
+    return;
+  }
+
+  const [, action, agentId] = interaction.customId.split(":");
+  const agent = agents.find((item) => item.id === agentId);
+
+  if (interaction.isButton() && action === "model" && agent) {
+    const input = new TextInputBuilder()
+      .setCustomId("model")
+      .setLabel("Идентификатор модели OpenRouter")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setValue(runtimeAgent(store, agent).model)
+      .setPlaceholder("deepseek/deepseek-v4-flash-0731");
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId(`settings:model_submit:${agent.id}`)
+        .setTitle(`Модель: ${agent.name}`)
+        .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input))
+    );
+    return;
+  }
+  if (interaction.isButton() && action === "context" && agent) {
+    const value = store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES);
+    const input = new TextInputBuilder()
+      .setCustomId("context_limit")
+      .setLabel("Сообщений в контексте (4–100)")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setValue(String(value));
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId(`settings:context_submit:${agent.id}`)
+        .setTitle(`Контекст: ${agent.name}`)
+        .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input))
+    );
+    return;
+  }
+  if (interaction.isButton() && action === "clear" && agent) {
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`settings:clear_confirm:${agent.id}`).setLabel("Да, очистить контекст").setStyle(ButtonStyle.Danger)
+    );
+    await interaction.reply({ content: `Очистить память агента **${agent.name}** и начать новую сессию? Сообщения Discord останутся.`, components: [row], ephemeral: true });
+    return;
+  }
+  if (interaction.isButton() && action === "compact" && agent && interaction.guild) {
+    const channelId = findAgentChannelId(interaction.guild, agent);
+    if (!channelId) throw new Error(`канал #${agent.channelName} не найден`);
+    const context = await store.recent(channelId, 100);
+    if (!context.length) {
+      await interaction.reply({ content: "Контекст пока пуст — компактировать нечего.", ephemeral: true });
+      return;
+    }
+    if (!store.consumeRequest()) {
+      await interaction.reply({ content: "Достигнут дневной лимит запросов к моделям.", ephemeral: true });
+      return;
+    }
+    await interaction.deferReply({ ephemeral: true });
+    const configuredAgent = runtimeAgent(store, agent);
+    const result = await askAgent(
+      configuredAgent,
+      context,
+      "Сожми историю этой сессии в самостоятельную рабочую сводку. Сохрани цели, решения, важные факты, ограничения и незавершённые задачи. Удали повторы и разговорный шум. Не добавляй новых сведений.",
+      store.getNumberSetting("max_output_tokens", 30_000)
+    );
+    await store.recordUsage({ channelId, agentId: agent.id, model: result.model, ...result.usage });
+    await store.replaceContext(channelId, "Сводка контекста", result.content);
+    const channel = await interaction.guild.channels.fetch(channelId);
+    if (channel?.isTextBased() && !channel.isDMBased()) {
+      await sendAsAgent(channel as TextChannel, configuredAgent, `Контекст сжат:\n\n${result.content}`);
+    }
+    await interaction.editReply(`Контекст агента **${agent.name}** сжат до рабочей сводки.`);
+    return;
+  }
+  if (interaction.isButton() && action === "clear_confirm" && agent && interaction.guild) {
+    const channelId = findAgentChannelId(interaction.guild, agent);
+    if (!channelId) throw new Error(`канал #${agent.channelName} не найден`);
+    await store.clearContext(channelId);
+    await interaction.update({ content: `Контекст агента **${agent.name}** очищен.`, components: [] });
+    return;
+  }
+
+  if (interaction.isModalSubmit() && action === "model_submit" && agent) {
+    const model = interaction.fields.getTextInputValue("model").trim();
+    if (!model.includes("/") || model.length > 150) throw new Error("укажи полный ID модели OpenRouter в формате provider/model");
+    await store.setSetting(`agent_model:${agent.id}`, model);
+    await interaction.reply({ content: `Модель агента **${agent.name}** изменена на \`${model}\`.`, ephemeral: true });
+    return;
+  }
+  if (interaction.isModalSubmit() && action === "context_submit" && agent) {
+    const limit = boundedNumber(interaction.fields.getTextInputValue("context_limit"), 4, 100, "лимит контекста");
+    await store.setSetting(`context_limit:${agent.id}`, String(limit));
+    await interaction.reply({ content: `Контекст агента **${agent.name}**: последние **${limit}** сообщений.`, ephemeral: true });
+    return;
+  }
+  if (interaction.isModalSubmit() && action === "limits_submit") {
+    const maxReplies = boundedNumber(interaction.fields.getTextInputValue("max_replies"), 1, 10, "ответы за раунд");
+    const dailyLimit = boundedNumber(interaction.fields.getTextInputValue("daily_limit"), 1, 10_000, "дневной лимит");
+    const maxTokens = boundedNumber(interaction.fields.getTextInputValue("max_tokens"), 256, 100_000, "лимит токенов ответа");
+    await Promise.all([
+      store.setSetting("max_agent_replies", String(maxReplies)),
+      store.setSetting("daily_request_limit", String(dailyLimit)),
+      store.setSetting("max_output_tokens", String(maxTokens))
+    ]);
+    await interaction.reply({ content: `Лимиты сохранены: ответов за раунд ${maxReplies}, запросов в день ${dailyLimit}, токенов ответа ${maxTokens.toLocaleString("ru-RU")}.`, ephemeral: true });
+  }
+}
+
+async function buildAgentSettings(store: Store, guild: Guild, agent: Agent) {
+  const channelId = findAgentChannelId(guild, agent);
+  const stats = channelId ? await store.usageStats(channelId) : null;
+  const configured = runtimeAgent(store, agent);
+  const contextLimit = store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES);
+  const description = [
+    `Канал: **#${agent.channelName}**${channelId ? "" : " — не найден"}`,
+    `Модель: \`${configured.model}\``,
+    `Лимит контекста: **${contextLimit} сообщений**`,
+    stats ? `Использовано: **${stats.allTime.totalTokens.toLocaleString("ru-RU")}** токенов · **$${stats.allTime.costUsd.toFixed(6)}**` : "Статистика пока недоступна"
+  ].join("\n");
+  return {
+    embeds: [new EmbedBuilder().setTitle(`${agent.emoji} ${agent.name}`).setDescription(description).setColor(agent.color)],
+    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`settings:model:${agent.id}`).setLabel("Изменить модель").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`settings:context:${agent.id}`).setLabel("Контекст").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`settings:compact:${agent.id}`).setLabel("Сжать").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`settings:clear:${agent.id}`).setLabel("Очистить").setStyle(ButtonStyle.Danger)
+    )]
+  };
+}
+
+function buildLimitsModal(store: Store) {
+  const fields = [
+    new TextInputBuilder().setCustomId("max_replies").setLabel("Ответов агентов за раунд (1–10)").setValue(String(store.getNumberSetting("max_agent_replies", config.MAX_AGENT_REPLIES))).setStyle(TextInputStyle.Short),
+    new TextInputBuilder().setCustomId("daily_limit").setLabel("Запросов к моделям в день (1–10000)").setValue(String(store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT))).setStyle(TextInputStyle.Short),
+    new TextInputBuilder().setCustomId("max_tokens").setLabel("Максимум токенов ответа (256–100000)").setValue(String(store.getNumberSetting("max_output_tokens", 30_000))).setStyle(TextInputStyle.Short)
+  ];
+  return new ModalBuilder()
+    .setCustomId("settings:limits_submit")
+    .setTitle("Общие лимиты ARGUS")
+    .addComponents(...fields.map((field) => new ActionRowBuilder<TextInputBuilder>().addComponents(field)));
+}
+
+function findAgentChannelId(guild: Guild, agent: Agent): string | undefined {
+  const configured = config.agentChannelIds[agent.id];
+  if (configured) return configured;
+  return guild.channels.cache.find((channel) => channel.isTextBased() && String(channel.name).toLowerCase() === agent.channelName)?.id;
+}
+
+function boundedNumber(raw: string, min: number, max: number, label: string): number {
+  const value = Number(raw.trim());
+  if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${label}: нужно целое число от ${min} до ${max}`);
+  return value;
+}
+
 async function formatChannelStatus(store: Store, channelId: string, agent: Agent): Promise<string> {
   const stats = await store.usageStats(channelId);
+  const configured = runtimeAgent(store, agent);
   const sessionStart = stats.sessionStartedAt
     ? new Date(stats.sessionStartedAt).toLocaleString("ru-RU")
     : "с первого сообщения";
-  const models = stats.models.length ? stats.models.join(", ") : agent.model;
+  const models = stats.models.length ? stats.models.join(", ") : configured.model;
   return [
     `**${agent.emoji} ${agent.name}**`,
     `Модель: \`${models}\``,
     `Сессия: ${sessionStart}`,
     `Сообщений в контексте: **${stats.contextMessages}**`,
+    `Лимит контекста: **${store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES)}**`,
     `Запросов в сессии: **${stats.session.requests}**`,
     `Токены сессии: **${stats.session.totalTokens.toLocaleString("ru-RU")}** (вход ${stats.session.promptTokens.toLocaleString("ru-RU")}, выход ${stats.session.completionTokens.toLocaleString("ru-RU")})`,
     `Стоимость сессии по данным OpenRouter: **$${stats.session.costUsd.toFixed(6)}**`,

@@ -30,6 +30,7 @@ export class Store {
   private requestDay = new Date().toISOString().slice(0, 10);
   private usage: Array<UsageInput & { createdAt: Date }> = [];
   private sessionStarts = new Map<string, Date>();
+  private settings = new Map<string, string>();
 
   async init() {
     if (!config.DATABASE_URL) {
@@ -73,6 +74,15 @@ export class Store {
         started_at timestamptz not null default now()
       )
     `;
+    await this.sql`
+      create table if not exists runtime_settings (
+        key text primary key,
+        value text not null,
+        updated_at timestamptz not null default now()
+      )
+    `;
+    const settings = await this.sql<{ key: string; value: string }[]>`select key, value from runtime_settings`;
+    for (const item of settings) this.settings.set(item.key, item.value);
   }
 
   async addMessage(message: StoredMessage) {
@@ -189,6 +199,23 @@ export class Store {
     };
   }
 
+  getSetting(key: string): string | undefined {
+    return this.settings.get(key);
+  }
+
+  getNumberSetting(key: string, fallback: number): number {
+    const value = Number(this.settings.get(key));
+    return Number.isFinite(value) ? value : fallback;
+  }
+
+  async setSetting(key: string, value: string) {
+    this.settings.set(key, value);
+    if (this.sql) await this.sql`
+      insert into runtime_settings (key, value) values (${key}, ${value})
+      on conflict (key) do update set value = excluded.value, updated_at = now()
+    `;
+  }
+
   async recent(channelId: string, limit: number): Promise<ContextMessage[]> {
     if (!this.sql) return this.memory.filter((item) => item.channelId === channelId).slice(-limit);
     const rows = await this.sql<{ author: string; content: string }[]>`
@@ -219,7 +246,7 @@ export class Store {
       this.requestDay = today;
       this.requestsToday = 0;
     }
-    if (this.requestsToday >= config.DAILY_REQUEST_LIMIT) return false;
+    if (this.requestsToday >= this.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT)) return false;
     this.requestsToday += 1;
     return true;
   }

@@ -41,7 +41,12 @@ function readText(content: string | Array<{ type?: string; text?: string }> | nu
   return "";
 }
 
-export async function askAgent(agent: Agent, context: ContextMessage[], currentRequest: string): Promise<AgentResponse> {
+export async function askAgent(
+  agent: Agent,
+  context: ContextMessage[],
+  currentRequest: string,
+  maxTokens = 30_000
+): Promise<AgentResponse> {
   const transcript = context.map((item) => `${item.author}: ${item.content}`).join("\n");
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -61,7 +66,7 @@ export async function askAgent(agent: Agent, context: ContextMessage[], currentR
         }
       ],
       temperature: agent.id === "creative" ? 0.9 : 0.55,
-      max_tokens: 30_000,
+      max_tokens: maxTokens,
       reasoning: { effort: "low", exclude: true }
     }),
     signal: AbortSignal.timeout(90_000)
