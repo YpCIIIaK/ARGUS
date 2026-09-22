@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: forumds
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.13.1
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DEFAULT_MODEL
+        value: openrouter/auto
+      - key: AUTONOMOUS_ENABLED
+        value: "false"
