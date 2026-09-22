@@ -179,10 +179,14 @@ async function readBountyChannel(message: Message): Promise<Array<{ author: stri
       return [];
     }
     const messages = await channel.messages.fetch({ limit: 20 });
-    return [...messages.values()]
+    const history = [...messages.values()]
       .filter((item) => item.content.trim())
       .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
       .map((item) => ({ author: "Bounty Monitor", content: item.content.trim() }));
+    if (!history.length) {
+      await message.reply("Канал Bounty Monitor доступен, но в нём пока нет сообщений. Запусти ручной скан в Vercel и проверь `DISCORD_WEBHOOK_URL`.");
+    }
+    return history;
   } catch (error) {
     console.error("Failed to read Bounty Monitor channel", error);
     await message.reply("Не удалось прочитать канал Bounty Monitor. Проверь ID канала и права View Channel / Read Message History.");
