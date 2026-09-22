@@ -2,7 +2,25 @@ import postgres, { type Sql } from "postgres";
 import { config } from "./config.js";
 import type { ContextMessage } from "./openrouter.js";
 
-type StoredMessage = ContextMessage & { channelId: string; discordMessageId: string };
+type StoredMessage = ContextMessage & { channelId: string; discordMessageId: string; createdAt?: Date };
+
+export type UsageInput = {
+  channelId: string;
+  agentId: string;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  costUsd: number;
+};
+
+export type UsageStats = {
+  sessionStartedAt: string | null;
+  contextMessages: number;
+  session: { requests: number; promptTokens: number; completionTokens: number; totalTokens: number; costUsd: number };
+  allTime: { requests: number; totalTokens: number; costUsd: number };
+  models: string[];
+};
 
 export class Store {
   private sql: Sql | null = null;
@@ -10,6 +28,8 @@ export class Store {
   private paused = false;
   private requestsToday = 0;
   private requestDay = new Date().toISOString().slice(0, 10);
+  private usage: Array<UsageInput & { createdAt: Date }> = [];
+  private sessionStarts = new Map<string, Date>();
 
   async init() {
     if (!config.DATABASE_URL) {
@@ -34,11 +54,30 @@ export class Store {
         updated_at timestamptz not null default now()
       )
     `;
+    await this.sql`
+      create table if not exists usage_events (
+        id bigserial primary key,
+        channel_id text not null,
+        agent_id text not null,
+        model text not null,
+        prompt_tokens bigint not null default 0,
+        completion_tokens bigint not null default 0,
+        total_tokens bigint not null default 0,
+        cost_usd double precision not null default 0,
+        created_at timestamptz not null default now()
+      )
+    `;
+    await this.sql`
+      create table if not exists channel_sessions (
+        channel_id text primary key,
+        started_at timestamptz not null default now()
+      )
+    `;
   }
 
   async addMessage(message: StoredMessage) {
     if (!this.sql) {
-      this.memory.push(message);
+      this.memory.push({ ...message, createdAt: new Date() });
       this.memory = this.memory.slice(-500);
       return;
     }
@@ -47,6 +86,107 @@ export class Store {
       values (${message.channelId}, ${message.discordMessageId}, ${message.author}, ${message.content})
       on conflict (discord_message_id) do nothing
     `;
+  }
+
+  async clearContext(channelId: string) {
+    const now = new Date();
+    if (!this.sql) {
+      this.memory = this.memory.filter((item) => item.channelId !== channelId);
+      this.sessionStarts.set(channelId, now);
+      return;
+    }
+    await this.sql.begin(async (sql) => {
+      await sql`delete from messages where channel_id = ${channelId}`;
+      await sql`
+        insert into channel_sessions (channel_id, started_at) values (${channelId}, ${now})
+        on conflict (channel_id) do update set started_at = excluded.started_at
+      `;
+    });
+  }
+
+  async replaceContext(channelId: string, author: string, content: string) {
+    const id = `summary-${crypto.randomUUID()}`;
+    if (!this.sql) {
+      this.memory = this.memory.filter((item) => item.channelId !== channelId);
+      this.memory.push({ channelId, discordMessageId: id, author, content, createdAt: new Date() });
+      return;
+    }
+    await this.sql.begin(async (sql) => {
+      await sql`delete from messages where channel_id = ${channelId}`;
+      await sql`
+        insert into messages (channel_id, discord_message_id, author, content)
+        values (${channelId}, ${id}, ${author}, ${content})
+      `;
+    });
+  }
+
+  async recordUsage(input: UsageInput) {
+    if (!this.sql) {
+      this.usage.push({ ...input, createdAt: new Date() });
+      return;
+    }
+    await this.sql`
+      insert into usage_events (
+        channel_id, agent_id, model, prompt_tokens, completion_tokens, total_tokens, cost_usd
+      ) values (
+        ${input.channelId}, ${input.agentId}, ${input.model}, ${input.promptTokens},
+        ${input.completionTokens}, ${input.totalTokens}, ${input.costUsd}
+      )
+    `;
+  }
+
+  async usageStats(channelId: string): Promise<UsageStats> {
+    if (!this.sql) {
+      const started = this.sessionStarts.get(channelId) ?? null;
+      const all = this.usage.filter((item) => item.channelId === channelId);
+      const session = started ? all.filter((item) => item.createdAt >= started) : all;
+      return {
+        sessionStartedAt: started?.toISOString() ?? null,
+        contextMessages: this.memory.filter((item) => item.channelId === channelId).length,
+        session: sumUsage(session),
+        allTime: sumAllTime(all),
+        models: [...new Set(session.map((item) => item.model))]
+      };
+    }
+    const sessionRows = await this.sql<{ started_at: Date }[]>`
+      select started_at from channel_sessions where channel_id = ${channelId}
+    `;
+    const started = sessionRows[0]?.started_at ?? new Date(0);
+    const [counts, sessionUsage, allUsage, models] = await Promise.all([
+      this.sql<{ count: string }[]>`select count(*)::text as count from messages where channel_id = ${channelId}`,
+      this.sql<{ requests: string; prompt: string; completion: string; total: string; cost: number }[]>`
+        select count(*)::text as requests,
+          coalesce(sum(prompt_tokens), 0)::text as prompt,
+          coalesce(sum(completion_tokens), 0)::text as completion,
+          coalesce(sum(total_tokens), 0)::text as total,
+          coalesce(sum(cost_usd), 0)::float8 as cost
+        from usage_events where channel_id = ${channelId} and created_at >= ${started}
+      `,
+      this.sql<{ requests: string; total: string; cost: number }[]>`
+        select count(*)::text as requests,
+          coalesce(sum(total_tokens), 0)::text as total,
+          coalesce(sum(cost_usd), 0)::float8 as cost
+        from usage_events where channel_id = ${channelId}
+      `,
+      this.sql<{ model: string }[]>`
+        select distinct model from usage_events where channel_id = ${channelId} and created_at >= ${started}
+      `
+    ]);
+    const current = sessionUsage[0]!;
+    const total = allUsage[0]!;
+    return {
+      sessionStartedAt: started.getTime() === 0 ? null : started.toISOString(),
+      contextMessages: Number(counts[0]?.count ?? 0),
+      session: {
+        requests: Number(current.requests),
+        promptTokens: Number(current.prompt),
+        completionTokens: Number(current.completion),
+        totalTokens: Number(current.total),
+        costUsd: Number(current.cost)
+      },
+      allTime: { requests: Number(total.requests), totalTokens: Number(total.total), costUsd: Number(total.cost) },
+      models: models.map((item) => item.model)
+    };
   }
 
   async recent(channelId: string, limit: number): Promise<ContextMessage[]> {
@@ -87,4 +227,24 @@ export class Store {
   getRequestsToday() {
     return this.requestsToday;
   }
+}
+
+function sumUsage(items: Array<UsageInput>) {
+  return items.reduce(
+    (sum, item) => ({
+      requests: sum.requests + 1,
+      promptTokens: sum.promptTokens + item.promptTokens,
+      completionTokens: sum.completionTokens + item.completionTokens,
+      totalTokens: sum.totalTokens + item.totalTokens,
+      costUsd: sum.costUsd + item.costUsd
+    }),
+    { requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0 }
+  );
+}
+
+function sumAllTime(items: Array<UsageInput>) {
+  return items.reduce(
+    (sum, item) => ({ requests: sum.requests + 1, totalTokens: sum.totalTokens + item.totalTokens, costUsd: sum.costUsd + item.costUsd }),
+    { requests: 0, totalTokens: 0, costUsd: 0 }
+  );
 }

@@ -5,6 +5,7 @@ export type AgentId = "programmer" | "engineer" | "creative" | "researcher" | "c
 export type Agent = {
   id: AgentId;
   name: string;
+  channelName: string;
   emoji: string;
   color: number;
   model: string;
@@ -18,6 +19,7 @@ export const agents: Agent[] = [
   {
     id: "programmer",
     name: "Программист",
+    channelName: "developer",
     emoji: "💻",
     color: 0x4f8cff,
     model: config.PROGRAMMER_MODEL || config.DEFAULT_MODEL,
@@ -27,6 +29,7 @@ export const agents: Agent[] = [
   {
     id: "engineer",
     name: "Инженер",
+    channelName: "engineer",
     emoji: "⚙️",
     color: 0xf59e0b,
     model: config.ENGINEER_MODEL || config.DEFAULT_MODEL,
@@ -36,6 +39,7 @@ export const agents: Agent[] = [
   {
     id: "creative",
     name: "Креативщик",
+    channelName: "creative",
     emoji: "🎨",
     color: 0xec4899,
     model: config.CREATIVE_MODEL || config.DEFAULT_MODEL,
@@ -45,6 +49,7 @@ export const agents: Agent[] = [
   {
     id: "researcher",
     name: "Исследователь",
+    channelName: "researcher",
     emoji: "🔎",
     color: 0x10b981,
     model: config.RESEARCHER_MODEL || config.DEFAULT_MODEL,
@@ -54,6 +59,7 @@ export const agents: Agent[] = [
   {
     id: "coordinator",
     name: "Координатор",
+    channelName: "coordinator",
     emoji: "🧭",
     color: 0x8b5cf6,
     model: config.COORDINATOR_MODEL || config.DEFAULT_MODEL,

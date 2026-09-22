@@ -13,6 +13,24 @@ type OpenRouterResponse = {
     };
   }>;
   error?: { message?: string };
+  model?: string;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    cost?: number;
+  };
+};
+
+export type AgentResponse = {
+  content: string;
+  model: string;
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    costUsd: number;
+  };
 };
 
 function readText(content: string | Array<{ type?: string; text?: string }> | null | undefined): string {
@@ -23,7 +41,7 @@ function readText(content: string | Array<{ type?: string; text?: string }> | nu
   return "";
 }
 
-export async function askAgent(agent: Agent, context: ContextMessage[], currentRequest: string): Promise<string> {
+export async function askAgent(agent: Agent, context: ContextMessage[], currentRequest: string): Promise<AgentResponse> {
   const transcript = context.map((item) => `${item.author}: ${item.content}`).join("\n");
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -58,5 +76,14 @@ export async function askAgent(agent: Agent, context: ContextMessage[], currentR
     const reasoningOnly = Boolean(choice?.message?.reasoning?.trim());
     throw new Error(`OpenRouter returned an empty answer (finish_reason=${finishReason}, reasoning_only=${reasoningOnly})`);
   }
-  return content;
+  return {
+    content,
+    model: data.model || agent.model,
+    usage: {
+      promptTokens: data.usage?.prompt_tokens ?? 0,
+      completionTokens: data.usage?.completion_tokens ?? 0,
+      totalTokens: data.usage?.total_tokens ?? 0,
+      costUsd: data.usage?.cost ?? 0
+    }
+  };
 }

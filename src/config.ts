@@ -16,6 +16,11 @@ const schema = z.object({
   BOUNTY_CHANNEL_ID: z.string().optional(),
   BOUNTY_MONITOR_URL: z.preprocess((value) => value === "" ? undefined : value, z.string().url().optional()),
   BOUNTY_MONITOR_TOKEN: z.string().optional(),
+  PROGRAMMER_CHANNEL_ID: z.string().optional(),
+  ENGINEER_CHANNEL_ID: z.string().optional(),
+  CREATIVE_CHANNEL_ID: z.string().optional(),
+  RESEARCHER_CHANNEL_ID: z.string().optional(),
+  COORDINATOR_CHANNEL_ID: z.string().optional(),
   DEFAULT_MODEL: z.string().default("openrouter/auto"),
   PROGRAMMER_MODEL: z.string().optional(),
   ENGINEER_MODEL: z.string().optional(),
@@ -40,5 +45,12 @@ const env = result.data;
 export const config = {
   ...env,
   allowedChannelIds: new Set(env.ALLOWED_CHANNEL_IDS.split(",").map((v) => v.trim()).filter(Boolean)),
-  ownerIds: new Set(env.OWNER_IDS.split(",").map((v) => v.trim()).filter(Boolean))
+  ownerIds: new Set(env.OWNER_IDS.split(",").map((v) => v.trim()).filter(Boolean)),
+  agentChannelIds: {
+    programmer: env.PROGRAMMER_CHANNEL_ID,
+    engineer: env.ENGINEER_CHANNEL_ID,
+    creative: env.CREATIVE_CHANNEL_ID,
+    researcher: env.RESEARCHER_CHANNEL_ID,
+    coordinator: env.COORDINATOR_CHANNEL_ID
+  }
 };

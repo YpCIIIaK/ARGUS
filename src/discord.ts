@@ -61,14 +61,16 @@ async function handleMessage(message: Message, store: Store) {
     author: message.member?.displayName || message.author.displayName,
     content: text
   });
-  await runDiscussion(message, store, selectAgents(text), text);
+  const channelAgent = agentForChannel(message);
+  await runDiscussion(message, store, channelAgent ? [channelAgent] : selectAgents(text), text);
 }
 
 async function handleCommand(message: Message, store: Store) {
   const [rawCommand, ...rest] = message.content.slice(1).trim().split(/\s+/);
   const command = rawCommand?.toLowerCase();
+  const channelAgent = agentForChannel(message);
   if (command === "agents") {
-    const active = agents.map((a) => `${a.emoji} **${a.name}** — \`${a.model}\``).join("\n");
+    const active = agents.map((a) => `${a.emoji} **${a.name}** — \`${a.model}\` — #${a.channelName}`).join("\n");
     const bounty = config.BOUNTY_CHANNEL_ID
       ? "\n🔭 **Bounty Monitor** — изолированный источник, доступен через `!bounty`"
       : "";
@@ -76,7 +78,76 @@ async function handleCommand(message: Message, store: Store) {
     return;
   }
   if (command === "status") {
+    if (channelAgent) {
+      await message.reply(await formatChannelStatus(store, message.channelId, channelAgent));
+      return;
+    }
     await message.reply(`Состояние: **${(await store.isPaused()) ? "пауза" : "активно"}**\nЗапросов к моделям сегодня: **${store.getRequestsToday()} / ${config.DAILY_REQUEST_LIMIT}**`);
+    return;
+  }
+  if (command === "context" || command === "session") {
+    if (!channelAgent) {
+      await message.reply("Эта команда предназначена для персонального канала агента.");
+      return;
+    }
+    await message.reply(await formatChannelStatus(store, message.channelId, channelAgent));
+    return;
+  }
+  if (command === "model") {
+    if (!channelAgent) {
+      await message.reply("Открой персональный канал агента, чтобы посмотреть его модель.");
+      return;
+    }
+    await message.reply(`**${channelAgent.name}** использует модель \`${channelAgent.model}\`.`);
+    return;
+  }
+  if (command === "clear") {
+    if (!channelAgent) {
+      await message.reply("Контекст очищается отдельно в персональном канале агента.");
+      return;
+    }
+    if (!isController(message)) {
+      await message.reply("Очистка контекста доступна владельцам и администраторам сервера.");
+      return;
+    }
+    await store.clearContext(message.channelId);
+    await message.reply(`Контекст ${channelAgent.name} очищен. Сообщения в самом Discord не удалялись; новая сессия началась сейчас.`);
+    return;
+  }
+  if (command === "compact") {
+    if (!channelAgent) {
+      await message.reply("Компактизация выполняется отдельно в персональном канале агента.");
+      return;
+    }
+    const context = await store.recent(message.channelId, 100);
+    if (!context.length) {
+      await message.reply("Контекст пока пуст — компактировать нечего.");
+      return;
+    }
+    if (!store.consumeRequest()) {
+      await message.reply("Достигнут дневной лимит запросов к моделям.");
+      return;
+    }
+    await message.reply("Сжимаю текущий контекст в краткую сводку…");
+    try {
+      const result = await askAgent(
+        channelAgent,
+        context,
+        "Сожми историю этой сессии в самостоятельную рабочую сводку. Сохрани цели, решения, важные факты, ограничения и незавершённые задачи. Удали повторы и разговорный шум. Не добавляй новых сведений."
+      );
+      await store.recordUsage({ channelId: message.channelId, agentId: channelAgent.id, model: result.model, ...result.usage });
+      await store.replaceContext(message.channelId, "Сводка контекста", result.content);
+      await sendAsAgent(message.channel as TextChannel, channelAgent, `Контекст сжат:\n\n${result.content}`);
+    } catch (error) {
+      console.error("Context compaction failed", error);
+      await message.reply(`Не удалось сжать контекст: ${errorMessage(error)}`);
+    }
+    return;
+  }
+  if (command === "help") {
+    await message.reply(
+      "Команды: `!discuss <тема>`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!agents`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
+    );
     return;
   }
   if (command === "pause" || command === "resume") {
@@ -150,7 +221,7 @@ async function handleCommand(message: Message, store: Store) {
     await runDiscussion(message, store, selectAgents(topic, true), topic);
     return;
   }
-  await message.reply("Команды: `!discuss <тема>`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!agents`, `!status`, `!pause`, `!resume`.");
+  await message.reply("Неизвестная команда. Используй `!help`, чтобы посмотреть доступные команды.");
 }
 
 function isController(message: Message) {
@@ -178,10 +249,11 @@ async function runDiscussion(
         ...(await store.recent(message.channelId, config.MAX_CONTEXT_MESSAGES)),
         ...extraContext
       ];
-      const answer = await askAgent(agent, context, currentRequest);
-      if (answer === "[PASS]" || answer.startsWith("[PASS]")) continue;
-      const sent = await sendAsAgent(message.channel as TextChannel, agent, answer);
-      await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: answer });
+      const result = await askAgent(agent, context, currentRequest);
+      await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
+      if (result.content === "[PASS]" || result.content.startsWith("[PASS]")) continue;
+      const sent = await sendAsAgent(message.channel as TextChannel, agent, result.content);
+      await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: result.content });
     } catch (error) {
       console.error(`${agent.name} failed`, error);
       try {
@@ -229,6 +301,31 @@ function requestedReplyLimit(text: string): number | null {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function agentForChannel(message: Message): Agent | undefined {
+  const byId = agents.find((agent) => config.agentChannelIds[agent.id] === message.channelId);
+  if (byId) return byId;
+  const channelName = "name" in message.channel ? String(message.channel.name ?? "").toLowerCase() : "";
+  return agents.find((agent) => agent.channelName === channelName);
+}
+
+async function formatChannelStatus(store: Store, channelId: string, agent: Agent): Promise<string> {
+  const stats = await store.usageStats(channelId);
+  const sessionStart = stats.sessionStartedAt
+    ? new Date(stats.sessionStartedAt).toLocaleString("ru-RU")
+    : "с первого сообщения";
+  const models = stats.models.length ? stats.models.join(", ") : agent.model;
+  return [
+    `**${agent.emoji} ${agent.name}**`,
+    `Модель: \`${models}\``,
+    `Сессия: ${sessionStart}`,
+    `Сообщений в контексте: **${stats.contextMessages}**`,
+    `Запросов в сессии: **${stats.session.requests}**`,
+    `Токены сессии: **${stats.session.totalTokens.toLocaleString("ru-RU")}** (вход ${stats.session.promptTokens.toLocaleString("ru-RU")}, выход ${stats.session.completionTokens.toLocaleString("ru-RU")})`,
+    `Стоимость сессии по данным OpenRouter: **$${stats.session.costUsd.toFixed(6)}**`,
+    `За всё время канала: **${stats.allTime.requests}** запросов, **${stats.allTime.totalTokens.toLocaleString("ru-RU")}** токенов, **$${stats.allTime.costUsd.toFixed(6)}**`
+  ].join("\n");
 }
 
 async function sendAsAgent(channel: TextChannel, agent: Agent, content: string) {
