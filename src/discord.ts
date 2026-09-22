@@ -43,7 +43,7 @@ function shouldHandle(message: Message, botId?: string) {
   if (!message.guild || !message.content.trim()) return false;
   if (config.BOUNTY_CHANNEL_ID && message.channelId === config.BOUNTY_CHANNEL_ID) return false;
   if (message.author.bot || message.webhookId || message.author.id === botId) return false;
-  if (config.allowedChannelIds.size && !config.allowedChannelIds.has(message.channelId)) return false;
+  if (config.allowedChannelIds.size && !config.allowedChannelIds.has(message.channelId) && !agentForChannel(message)) return false;
   return message.channel.isTextBased() && !message.channel.isDMBased();
 }
 
