@@ -31,6 +31,7 @@ export class Store {
   private usage: Array<UsageInput & { createdAt: Date }> = [];
   private sessionStarts = new Map<string, Date>();
   private settings = new Map<string, string>();
+  private processedEvents = new Set<string>();
 
   async init() {
     if (!config.DATABASE_URL) {
@@ -81,6 +82,13 @@ export class Store {
         updated_at timestamptz not null default now()
       )
     `;
+    await this.sql`
+      create table if not exists processed_events (
+        discord_message_id text primary key,
+        processed_at timestamptz not null default now()
+      )
+    `;
+    await this.sql`delete from processed_events where processed_at < now() - interval '30 days'`;
     const settings = await this.sql<{ key: string; value: string }[]>`select key, value from runtime_settings`;
     for (const item of settings) this.settings.set(item.key, item.value);
   }
@@ -214,6 +222,40 @@ export class Store {
       insert into runtime_settings (key, value) values (${key}, ${value})
       on conflict (key) do update set value = excluded.value, updated_at = now()
     `;
+  }
+
+  async claimEvent(discordMessageId: string): Promise<boolean> {
+    if (!this.sql) {
+      if (this.processedEvents.has(discordMessageId)) return false;
+      this.processedEvents.add(discordMessageId);
+      if (this.processedEvents.size > 5000) {
+        const oldest = this.processedEvents.values().next().value;
+        if (oldest) this.processedEvents.delete(oldest);
+      }
+      return true;
+    }
+    const rows = await this.sql<{ discord_message_id: string }[]>`
+      insert into processed_events (discord_message_id) values (${discordMessageId})
+      on conflict (discord_message_id) do nothing
+      returning discord_message_id
+    `;
+    return rows.length === 1;
+  }
+
+  async healthCheck(): Promise<{ ok: boolean; mode: "postgres" | "memory"; latencyMs: number; error?: string }> {
+    const started = Date.now();
+    if (!this.sql) return { ok: true, mode: "memory", latencyMs: Date.now() - started };
+    try {
+      await this.sql`select 1 as ok`;
+      return { ok: true, mode: "postgres", latencyMs: Date.now() - started };
+    } catch (error) {
+      return {
+        ok: false,
+        mode: "postgres",
+        latencyMs: Date.now() - started,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
   }
 
   async recent(channelId: string, limit: number): Promise<ContextMessage[]> {

@@ -45,10 +45,11 @@ export async function askAgent(
   agent: Agent,
   context: ContextMessage[],
   currentRequest: string,
-  maxTokens = 30_000
+  maxTokens = 30_000,
+  signal?: AbortSignal
 ): Promise<AgentResponse> {
   const transcript = context.map((item) => `${item.author}: ${item.content}`).join("\n");
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  const request = {
     method: "POST",
     headers: {
       Authorization: `Bearer ${config.OPENROUTER_API_KEY}`,
@@ -68,12 +69,38 @@ export async function askAgent(
       temperature: agent.id === "creative" ? 0.9 : 0.55,
       max_tokens: maxTokens,
       reasoning: { effort: "low", exclude: true }
-    }),
-    signal: AbortSignal.timeout(90_000)
-  });
+    })
+  } satisfies RequestInit;
 
-  const data = (await response.json()) as OpenRouterResponse;
-  if (!response.ok) throw new Error(data.error?.message || `OpenRouter returned ${response.status}`);
+  let response: Response | undefined;
+  let data: OpenRouterResponse | undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const timeout = AbortSignal.timeout(90_000);
+      response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        ...request,
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout
+      });
+      data = (await response.json().catch(() => ({}))) as OpenRouterResponse;
+      if (response.ok) break;
+      if (!isRetryableStatus(response.status) || attempt === 2) {
+        throw new Error(data.error?.message || `OpenRouter returned ${response.status}`);
+      }
+      const delayMs = retryDelay(response, attempt);
+      console.warn(`OpenRouter temporary error ${response.status}; retry ${attempt + 2}/3 in ${delayMs}ms`);
+      await abortableDelay(delayMs, signal);
+    } catch (error) {
+      if (signal?.aborted || isAbort(error)) throw error;
+      if (attempt === 2 || (response && !isRetryableStatus(response.status))) throw error;
+      const delayMs = 1000 * 2 ** attempt;
+      console.warn(`OpenRouter network error; retry ${attempt + 2}/3 in ${delayMs}ms`);
+      await abortableDelay(delayMs, signal);
+      response = undefined;
+      data = undefined;
+    }
+  }
+
+  if (!response?.ok || !data) throw new Error("OpenRouter request failed after retries");
   const choice = data.choices?.[0];
   const content = readText(choice?.message?.content);
   if (!content) {
@@ -91,4 +118,39 @@ export async function askAgent(
       costUsd: data.usage?.cost ?? 0
     }
   };
+}
+
+function isRetryableStatus(status: number): boolean {
+  return [408, 429, 500, 502, 503, 504].includes(status);
+}
+
+function retryDelay(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.min(Math.max(seconds * 1000, 500), 15_000);
+    const dateDelay = Date.parse(retryAfter) - Date.now();
+    if (Number.isFinite(dateDelay) && dateDelay > 0) return Math.min(dateDelay, 15_000);
+  }
+  return 1000 * 2 ** attempt;
+}
+
+function isAbort(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Aborted"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error("Aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }

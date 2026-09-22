@@ -11,9 +11,20 @@ await client.login(config.DISCORD_TOKEN);
 
 const app = express();
 app.get("/", (_request, response) => response.json({ name: "ForumDS", status: "ok" }));
-app.get("/health", (_request, response) => {
+app.get("/health", async (_request, response) => {
   const discordReady = client.isReady();
-  response.status(discordReady ? 200 : 503).json({ ok: discordReady, discord: discordReady ? "connected" : "disconnected" });
+  const database = await store.healthCheck();
+  const ok = discordReady && database.ok;
+  response.status(ok ? 200 : 503).json({
+    ok,
+    discord: discordReady ? "connected" : "disconnected",
+    database: {
+      status: database.ok ? "connected" : "error",
+      mode: database.mode,
+      latencyMs: database.latencyMs,
+      ...(database.error ? { error: database.error } : {})
+    }
+  });
 });
 
 const server = app.listen(config.PORT, "0.0.0.0", () => console.log(`Health server listening on ${config.PORT}`));

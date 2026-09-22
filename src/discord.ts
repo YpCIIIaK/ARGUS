@@ -25,6 +25,7 @@ import { Store } from "./store.js";
 const commandPrefix = "!";
 const webhookCache = new Map<string, WebhookClient>();
 const channelQueues = new Map<string, Promise<void>>();
+const activeRuns = new Map<string, AbortController>();
 
 export function createDiscordClient(store: Store) {
   const client = new Client({
@@ -33,8 +34,27 @@ export function createDiscordClient(store: Store) {
 
   client.once("clientReady", () => console.log(`Discord connected as ${client.user?.tag}`));
 
-  client.on("messageCreate", (message) => {
+  client.on("messageCreate", async (message) => {
     if (!shouldHandle(message, client.user?.id)) return;
+    try {
+      if (!(await store.claimEvent(message.id))) {
+        console.log(`Skipping duplicate Discord event ${message.id}`);
+        return;
+      }
+    } catch (error) {
+      console.error("Failed to claim Discord event", error);
+      return;
+    }
+    if (message.content.trim().toLowerCase() === "!stop") {
+      const active = activeRuns.get(message.channelId);
+      if (!active) {
+        await message.reply("В этом канале сейчас нет активной генерации.");
+      } else {
+        active.abort(new Error("Stopped by user"));
+        await message.reply("Останавливаю текущую генерацию…");
+      }
+      return;
+    }
     const previous = channelQueues.get(message.channelId) ?? Promise.resolve();
     const next = previous
       .then(() => handleMessage(message, store))
@@ -183,7 +203,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "help") {
     await message.reply(
-      "Команды: `!discuss <тема>`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
+      "Команды: `!discuss <тема>`, `!stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
     );
     return;
   }
@@ -273,41 +293,50 @@ async function runDiscussion(
   currentRequest: string,
   extraContext: Array<{ author: string; content: string }> = []
 ) {
+  const controller = new AbortController();
+  activeRuns.set(message.channelId, controller);
   const requestedLimit = requestedReplyLimit(currentRequest);
   const maxReplies = store.getNumberSetting("max_agent_replies", config.MAX_AGENT_REPLIES);
   const candidates = selected.slice(0, Math.min(maxReplies, requestedLimit ?? selected.length));
-  await (message.channel as TextChannel).sendTyping();
-  for (const agent of candidates) {
-    if (!store.consumeRequest()) {
-      await message.reply("Достигнут дневной лимит запросов к моделям.");
-      break;
-    }
-    try {
-      const configuredAgent = runtimeAgent(store, agent);
-      const contextLimit = store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES);
-      const context = [
-        ...(await store.recent(message.channelId, contextLimit)),
-        ...extraContext
-      ];
-      const result = await askAgent(
-        configuredAgent,
-        context,
-        currentRequest,
-        store.getNumberSetting("max_output_tokens", 30_000)
-      );
-      await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
-      if (result.content === "[PASS]" || result.content.startsWith("[PASS]")) continue;
-      const sent = await sendAsAgent(message.channel as TextChannel, configuredAgent, result.content);
-      await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: result.content });
-    } catch (error) {
-      console.error(`${agent.name} failed`, error);
-      try {
-        await message.reply(`Не удалось получить ответ агента «${agent.name}». Остальные агенты продолжат обсуждение.`);
-      } catch (notificationError) {
-        console.error("Failed to send agent error notification", notificationError);
+  try {
+    await (message.channel as TextChannel).sendTyping();
+    for (const agent of candidates) {
+      if (controller.signal.aborted) break;
+      if (!store.consumeRequest()) {
+        await message.reply("Достигнут дневной лимит запросов к моделям.");
+        break;
       }
-      continue;
+      try {
+        const configuredAgent = runtimeAgent(store, agent);
+        const contextLimit = store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES);
+        const context = [
+          ...(await store.recent(message.channelId, contextLimit)),
+          ...extraContext
+        ];
+        const result = await askAgent(
+          configuredAgent,
+          context,
+          currentRequest,
+          store.getNumberSetting("max_output_tokens", 30_000),
+          controller.signal
+        );
+        await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
+        if (result.content === "[PASS]" || result.content.startsWith("[PASS]")) continue;
+        const sent = await sendAsAgent(message.channel as TextChannel, configuredAgent, result.content);
+        await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: result.content });
+      } catch (error) {
+        if (controller.signal.aborted || isAbortError(error)) break;
+        console.error(`${agent.name} failed`, error);
+        try {
+          await message.reply(`Не удалось получить ответ агента «${agent.name}». Остальные агенты продолжат обсуждение.`);
+        } catch (notificationError) {
+          console.error("Failed to send agent error notification", notificationError);
+        }
+        continue;
+      }
     }
+  } finally {
+    if (activeRuns.get(message.channelId) === controller) activeRuns.delete(message.channelId);
   }
 }
 
@@ -346,6 +375,10 @@ function requestedReplyLimit(text: string): number | null {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || /abort|stopped/i.test(error.message));
 }
 
 function agentForChannel(message: Message): Agent | undefined {
@@ -595,9 +628,30 @@ async function formatChannelStatus(store: Store, channelId: string, agent: Agent
   ].join("\n");
 }
 
-async function sendAsAgent(channel: TextChannel, agent: Agent, content: string) {
+export function splitDiscordMessage(content: string, limit = 1900): string[] {
+  const text = content.trim();
+  if (!text) return [];
+  if (text.length <= limit) return [text];
+  const parts: string[] = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    const window = remaining.slice(0, limit + 1);
+    const paragraph = window.lastIndexOf("\n\n");
+    const line = window.lastIndexOf("\n");
+    const space = window.lastIndexOf(" ");
+    const best = Math.max(paragraph, line, space);
+    const cut = best >= Math.floor(limit * 0.55) ? best : limit;
+    parts.push(remaining.slice(0, cut).trimEnd());
+    remaining = remaining.slice(cut).trimStart();
+  }
+  if (remaining) parts.push(remaining);
+  return parts;
+}
+
+async function sendAsAgent(channel: TextChannel, agent: Agent, content: string): Promise<{ id: string }> {
+  const parts = splitDiscordMessage(content);
+  let webhook = webhookCache.get(channel.id);
   try {
-    let webhook = webhookCache.get(channel.id);
     if (!webhook) {
       const hooks = await channel.fetchWebhooks();
       const existing = hooks.find((item) => item.owner?.id === channel.client.user.id && item.token);
@@ -606,12 +660,29 @@ async function sendAsAgent(channel: TextChannel, agent: Agent, content: string) 
         : new WebhookClient({ url: (await channel.createWebhook({ name: "ForumDS Agents" })).url });
       webhookCache.set(channel.id, webhook);
     }
-    return await webhook.send({ content, username: `${agent.emoji} ${agent.name}`, allowedMentions: { parse: [] } });
   } catch (error) {
     console.warn("Webhook unavailable; falling back to a bot embed", error);
-    return channel.send({
-      embeds: [new EmbedBuilder().setAuthor({ name: `${agent.emoji} ${agent.name}` }).setDescription(content).setColor(agent.color)],
+    webhook = undefined;
+  }
+
+  let lastMessage: { id: string } | undefined;
+  for (const part of parts) {
+    if (webhook) {
+      try {
+        lastMessage = await webhook.send({ content: part, username: `${agent.emoji} ${agent.name}`, allowedMentions: { parse: [] } });
+        continue;
+      } catch (error) {
+        console.warn("Webhook send failed; using bot embeds for remaining parts", error);
+        webhookCache.delete(channel.id);
+        webhook.destroy();
+        webhook = undefined;
+      }
+    }
+    lastMessage = await channel.send({
+      embeds: [new EmbedBuilder().setAuthor({ name: `${agent.emoji} ${agent.name}` }).setDescription(part).setColor(agent.color)],
       allowedMentions: { parse: [] }
     });
   }
+  if (!lastMessage) throw new Error("Cannot send an empty agent response");
+  return lastMessage;
 }
