@@ -40,7 +40,7 @@ export async function askAgent(agent: Agent, context: ContextMessage[]): Promise
         { role: "user", content: `Текущая переписка:\n${transcript}\n\nОтветь как ${agent.name}.` }
       ],
       temperature: agent.id === "creative" ? 0.9 : 0.55,
-      max_tokens: 4096,
+      max_tokens: 30_000,
       reasoning: { effort: "low", exclude: true }
     }),
     signal: AbortSignal.timeout(90_000)
