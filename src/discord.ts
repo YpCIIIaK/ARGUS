@@ -21,7 +21,7 @@ export function createDiscordClient(store: Store) {
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
   });
 
-  client.once("ready", () => console.log(`Discord connected as ${client.user?.tag}`));
+  client.once("clientReady", () => console.log(`Discord connected as ${client.user?.tag}`));
 
   client.on("messageCreate", (message) => {
     if (!shouldHandle(message, client.user?.id)) return;
