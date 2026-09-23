@@ -16,6 +16,7 @@ import {
   type TextChannel,
   WebhookClient
 } from "discord.js";
+import { parseAgentActions, type GeneratedFile } from "./agent-actions.js";
 import { agents, selectAgents, type Agent } from "./agents.js";
 import { formatBountyRun, getBountyStatus, startBountyScan } from "./bounty.js";
 import { config } from "./config.js";
@@ -26,6 +27,15 @@ const commandPrefix = "!";
 const webhookCache = new Map<string, WebhookClient>();
 const channelQueues = new Map<string, Promise<void>>();
 const activeRuns = new Map<string, AbortController>();
+const maxDelegationsPerRun = 5;
+const maxDelegationDepth = 3;
+
+type AgentExecution = { agent: Agent; content: string; files: GeneratedFile[] };
+type WorkflowState = {
+  delegations: number;
+  seen: Set<string>;
+  progress: string[];
+};
 
 export function createDiscordClient(store: Store) {
   const client = new Client({
@@ -112,7 +122,7 @@ async function handleCommand(message: Message, store: Store) {
   const channelAgent = agentForChannel(message);
   if (command === "agents") {
     const active = agents
-      .map((a) => `${a.emoji} **${a.name}** — \`${runtimeAgent(store, a).model}\` — #${a.channelName}`)
+      .map((a) => `${a.emoji} **${a.name}** — \`${runtimeAgent(store, a).model}\` — #${a.channelName}\nВозможности: ${a.capabilities.map(capabilityLabel).join(", ")}`)
       .join("\n");
     const bounty = config.BOUNTY_CHANNEL_ID
       ? "\n🔭 **Bounty Monitor** — изолированный источник, доступен через `!bounty`"
@@ -299,33 +309,45 @@ async function runDiscussion(
   const requestedLimit = requestedReplyLimit(currentRequest);
   const maxReplies = store.getNumberSetting("max_agent_replies", config.MAX_AGENT_REPLIES);
   const candidates = selected.slice(0, Math.min(maxReplies, requestedLimit ?? selected.length));
+  const state: WorkflowState = { delegations: 0, seen: new Set(), progress: [] };
+  const progressMessage = await message.reply("⏳ ARGUS распределяет работу между агентами…");
   try {
     await (message.channel as TextChannel).sendTyping();
     for (const agent of candidates) {
       if (controller.signal.aborted) break;
-      if (!(await store.consumeRequest(store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT)))) {
-        await message.reply("Достигнут дневной лимит запросов к моделям.");
-        break;
-      }
       try {
-        const configuredAgent = runtimeAgent(store, agent);
-        const contextLimit = store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES);
-        const context = [
-          ...(await store.recent(message.channelId, contextLimit)),
-          ...extraContext
-        ];
-        const result = await askAgent(
-          configuredAgent,
-          context,
-          currentRequest,
-          store.getNumberSetting("max_output_tokens", 30_000),
-          controller.signal
-        );
-        await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
-        if (result.content === "[PASS]" || result.content.startsWith("[PASS]")) continue;
-        const sent = await sendAsAgent(message.channel as TextChannel, configuredAgent, result.content);
-        await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: result.content });
+        const executions = await executeAgentWorkflow({
+          message,
+          store,
+          agent,
+          task: currentRequest,
+          originalRequest: currentRequest,
+          extraContext,
+          depth: 0,
+          state,
+          signal: controller.signal,
+          updateProgress: () => updateWorkflowProgress(progressMessage, state)
+        });
+        for (const execution of executions) {
+          let storedMessageId: string | undefined;
+          if (execution.content && execution.content !== "[PASS]" && !execution.content.startsWith("[PASS]")) {
+            const sent = await sendAsAgent(message.channel as TextChannel, execution.agent, execution.content);
+            storedMessageId = sent.id;
+            await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: execution.agent.name, content: execution.content });
+          }
+          for (const file of execution.files) {
+            const sent = await sendGeneratedFile(message.channel as TextChannel, execution.agent, file);
+            if (!storedMessageId) {
+              storedMessageId = sent.id;
+              await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: execution.agent.name, content: `Создан файл: ${file.name}` });
+            }
+          }
+        }
       } catch (error) {
+        if (error instanceof DailyLimitError) {
+          await message.reply("Достигнут дневной лимит запросов к моделям.");
+          break;
+        }
         if (controller.signal.aborted || isAbortError(error)) break;
         console.error(`${agent.name} failed`, error);
         try {
@@ -337,8 +359,109 @@ async function runDiscussion(
       }
     }
   } finally {
+    const recentProgress = state.progress.slice(-8).join("\n");
+    await progressMessage.edit(controller.signal.aborted
+      ? `⛔ Выполнение остановлено.\n${recentProgress}`.slice(0, 1900)
+      : `✅ **Выполнение завершено** · внутренних передач: **${state.delegations}**\n${recentProgress}`.slice(0, 1900)).catch(() => undefined);
     if (activeRuns.get(message.channelId) === controller) activeRuns.delete(message.channelId);
   }
+}
+
+class DailyLimitError extends Error {}
+
+async function executeAgentWorkflow(input: {
+  message: Message;
+  store: Store;
+  agent: Agent;
+  task: string;
+  originalRequest: string;
+  extraContext: Array<{ author: string; content: string }>;
+  depth: number;
+  state: WorkflowState;
+  signal: AbortSignal;
+  updateProgress: () => Promise<void>;
+}): Promise<AgentExecution[]> {
+  const { message, store, agent, task, originalRequest, extraContext, depth, state, signal, updateProgress } = input;
+  if (signal.aborted) return [];
+  const signature = `${agent.id}:${task.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 500)}`;
+  if (state.seen.has(signature)) {
+    state.progress.push(`↩️ ${agent.emoji} ${agent.name}: повторная подзадача пропущена`);
+    await updateProgress();
+    return [];
+  }
+  state.seen.add(signature);
+  state.progress.push(`⏳ ${agent.emoji} ${agent.name}: работает`);
+  await updateProgress();
+
+  const dailyLimit = store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT);
+  if (!(await store.consumeRequest(dailyLimit))) throw new DailyLimitError();
+  const configuredAgent = runtimeAgent(store, agent);
+  const contextLimit = store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES);
+  const context = [...(await store.recent(message.channelId, contextLimit)), ...extraContext];
+  const result = await askAgent(
+    configuredAgent,
+    context,
+    workflowRequest(configuredAgent, task, originalRequest, depth),
+    store.getNumberSetting("max_output_tokens", 30_000),
+    signal
+  );
+  await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
+
+  const parsed = parseAgentActions(result.content, agent);
+  const executions: AgentExecution[] = [];
+  if (parsed.content || parsed.files.length) executions.push({ agent: configuredAgent, content: parsed.content, files: parsed.files });
+  markProgressDone(state, agent, parsed.delegations.length);
+  await updateProgress();
+
+  for (const delegation of parsed.delegations) {
+    if (signal.aborted || state.delegations >= maxDelegationsPerRun || depth >= maxDelegationDepth) break;
+    const target = agents.find((item) => item.id === delegation.agentId);
+    if (!target || target.id === agent.id) continue;
+    state.delegations += 1;
+    state.progress.push(`➡️ ${agent.name} → ${target.name}: ${delegation.task.slice(0, 100)}`);
+    await updateProgress();
+    executions.push(...await executeAgentWorkflow({
+      ...input,
+      agent: target,
+      task: `Запрос от агента «${agent.name}»: ${delegation.task}`,
+      depth: depth + 1
+    }));
+  }
+  return executions;
+}
+
+function workflowRequest(agent: Agent, task: string, originalRequest: string, depth: number): string {
+  const roster = agents.map((item) => `${item.id} (${item.name}): ${item.capabilities.join(", ")}`).join("; ");
+  const own = agent.capabilities.length ? agent.capabilities.join(", ") : "нет инструментов";
+  const createFileProtocol = agent.capabilities.includes("create_file")
+    ? `\nТы можешь создать файл. Для этого выведи блок:\n[CREATE_FILE name="filename.ext"]\nполное содержимое\n[/CREATE_FILE]\nПосле блока кратко объясни, что создано.`
+    : "";
+  return `ИСХОДНАЯ ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${originalRequest}\n\nТВОЯ ТЕКУЩАЯ ПОДЗАДАЧА (уровень ${depth}):\n${task}\n\nТвои возможности: ${own}.\nКоманда: ${roster}.\nЕсли для выполнения действительно нужна возможность другого агента, передай ему одну конкретную подзадачу точным блоком:\n[DELEGATE agent="programmer"]\nчто именно требуется сделать и какие данные использовать\n[/DELEGATE]\nМожно заменить programmer на engineer, creative, researcher или coordinator. Не делегируй то, что способен сделать сам. Не вызывай самого себя. Не утверждай, что помощник уже выполнил задачу.${createFileProtocol}`;
+}
+
+function markProgressDone(state: WorkflowState, agent: Agent, delegations: number) {
+  const pending = `⏳ ${agent.emoji} ${agent.name}: работает`;
+  let index = -1;
+  for (let current = state.progress.length - 1; current >= 0; current -= 1) {
+    if (state.progress[current] === pending) {
+      index = current;
+      break;
+    }
+  }
+  if (index >= 0) state.progress[index] = `✅ ${agent.emoji} ${agent.name}: готов${delegations ? `, запросил помощь (${delegations})` : ""}`;
+}
+
+async function updateWorkflowProgress(progressMessage: Message, state: WorkflowState) {
+  const lines = state.progress.slice(-15);
+  await progressMessage.edit(`**Ход выполнения**\n${lines.join("\n")}`.slice(0, 1900)).catch(() => undefined);
+}
+
+async function sendGeneratedFile(channel: TextChannel, agent: Agent, file: GeneratedFile): Promise<{ id: string }> {
+  return channel.send({
+    content: `${agent.emoji} **${agent.name}** создал файл \`${file.name}\``,
+    files: [{ attachment: Buffer.from(file.content, "utf8"), name: file.name }],
+    allowedMentions: { parse: [] }
+  });
 }
 
 async function readBountyChannel(message: Message): Promise<Array<{ author: string; content: string }>> {
@@ -391,6 +514,17 @@ function agentForChannel(message: Message): Agent | undefined {
 
 function runtimeAgent(store: Store, agent: Agent): Agent {
   return { ...agent, model: store.getSetting(`agent_model:${agent.id}`) || agent.model };
+}
+
+function capabilityLabel(capability: Agent["capabilities"][number]): string {
+  return ({
+    create_file: "создание файлов",
+    write_code: "написание кода",
+    architecture: "архитектура",
+    creative_content: "креативный контент",
+    research: "исследование",
+    coordination: "координация"
+  })[capability];
 }
 
 function isSettingsChannel(message: Message): boolean {
