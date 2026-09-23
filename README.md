@@ -86,4 +86,32 @@ npm run dev
 
 Первый доступный инструмент — создание текстового файла Программистом. Имя очищается от путей и опасных символов, размер ограничен 1 МБ, а содержимое отправляется напрямую как вложение Discord без сохранения на временном диске Render.
 
+## Подключение GitHub
+
+ARGUS использует GitHub App и запоминает отдельную привязку для каждого Discord user ID. На первом этапе интеграция только показывает репозитории, к которым пользователь разрешил доступ приложению; изменение кода не выполняется.
+
+1. В GitHub откройте **Settings → Developer settings → GitHub Apps → New GitHub App**.
+2. Укажите Homepage URL вашего Render-сервиса и точный Callback URL `https://<service>.onrender.com/auth/github/callback`. Не включайте wildcard matching.
+3. В Repository permissions оставьте `Metadata: Read-only` и задайте `Contents: Read-only`. Остальные разрешения не требуются.
+4. Включите истекающие user-to-server tokens. ARGUS обновляет их с помощью refresh token.
+5. Разрешите установку на нужный аккаунт, выберите только необходимые репозитории и скопируйте `Client ID`, новый `Client secret` и slug приложения из URL `github.com/apps/<slug>`.
+6. Сгенерируйте отдельный ключ шифрования:
+
+```powershell
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+7. Добавьте в Render Environment переменные `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_APP_SLUG`, `GITHUB_CALLBACK_URL` и `GITHUB_TOKEN_ENCRYPTION_KEY`.
+
+Команды пользователя:
+
+- `!github connect` — одноразовая ссылка авторизации на 10 минут, отправляемая только в личные сообщения;
+- `!github` — текущая привязка;
+- `!github repos` — репозитории, выбранные при установке GitHub App;
+- `!github disconnect` — подтверждаемая отвязка, удаление локальных токенов и отзыв GitHub authorization grant.
+
+Access и refresh tokens хранятся в PostgreSQL в формате AES-256-GCM. OAuth `state` сохраняется только как SHA-256 hash, одноразово потребляется callback-обработчиком и привязывает GitHub-аккаунт к инициировавшему команду Discord-пользователю. Удаление authorization grant не удаляет саму установку GitHub App из репозиториев; её можно отдельно удалить или изменить в настройках **GitHub Apps → Installed GitHub Apps**.
+
+Статус подключения, названия приватных репозиториев, OAuth-ссылка и подтверждение отвязки никогда не публикуются в общем канале — бот отправляет их пользователю через Discord DM.
+
 Кнопки и формы доступны владельцам и администраторам сервера. Значения сохраняются в PostgreSQL в таблице `runtime_settings`.

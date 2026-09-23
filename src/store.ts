@@ -22,6 +22,17 @@ export type UsageStats = {
   models: string[];
 };
 
+export type GithubConnection = {
+  discordUserId: string;
+  githubUserId: string;
+  githubLogin: string;
+  accessTokenEncrypted: string;
+  refreshTokenEncrypted: string | null;
+  accessTokenExpiresAt: Date | null;
+  refreshTokenExpiresAt: Date | null;
+  updatedAt: Date;
+};
+
 export class Store {
   private sql: Sql | null = null;
   private memory: StoredMessage[] = [];
@@ -32,6 +43,8 @@ export class Store {
   private sessionStarts = new Map<string, Date>();
   private settings = new Map<string, string>();
   private processedEvents = new Set<string>();
+  private githubOauthStates = new Map<string, { discordUserId: string; expiresAt: Date }>();
+  private githubConnections = new Map<string, GithubConnection>();
 
   async init() {
     if (!config.DATABASE_URL) {
@@ -88,7 +101,28 @@ export class Store {
         processed_at timestamptz not null default now()
       )
     `;
+    await this.sql`
+      create table if not exists github_oauth_states (
+        state_hash text primary key,
+        discord_user_id text not null,
+        expires_at timestamptz not null,
+        created_at timestamptz not null default now()
+      )
+    `;
+    await this.sql`
+      create table if not exists github_connections (
+        discord_user_id text primary key,
+        github_user_id text not null,
+        github_login text not null,
+        access_token_encrypted text not null,
+        refresh_token_encrypted text,
+        access_token_expires_at timestamptz,
+        refresh_token_expires_at timestamptz,
+        updated_at timestamptz not null default now()
+      )
+    `;
     await this.sql`delete from processed_events where processed_at < now() - interval '30 days'`;
+    await this.sql`delete from github_oauth_states where expires_at < now()`;
     const settings = await this.sql<{ key: string; value: string }[]>`select key, value from runtime_settings`;
     for (const item of settings) this.settings.set(item.key, item.value);
   }
@@ -240,6 +274,96 @@ export class Store {
       returning discord_message_id
     `;
     return rows.length === 1;
+  }
+
+  async createGithubOauthState(stateHash: string, discordUserId: string, expiresAt: Date) {
+    if (!this.sql) {
+      for (const [key, value] of this.githubOauthStates) {
+        if (value.discordUserId === discordUserId || value.expiresAt <= new Date()) this.githubOauthStates.delete(key);
+      }
+      this.githubOauthStates.set(stateHash, { discordUserId, expiresAt });
+      return;
+    }
+    await this.sql.begin(async (sql) => {
+      await sql`delete from github_oauth_states where discord_user_id = ${discordUserId} or expires_at < now()`;
+      await sql`
+        insert into github_oauth_states (state_hash, discord_user_id, expires_at)
+        values (${stateHash}, ${discordUserId}, ${expiresAt})
+      `;
+    });
+  }
+
+  async consumeGithubOauthState(stateHash: string): Promise<string | null> {
+    if (!this.sql) {
+      const state = this.githubOauthStates.get(stateHash);
+      this.githubOauthStates.delete(stateHash);
+      return state && state.expiresAt > new Date() ? state.discordUserId : null;
+    }
+    const rows = await this.sql<{ discord_user_id: string }[]>`
+      delete from github_oauth_states
+      where state_hash = ${stateHash} and expires_at > now()
+      returning discord_user_id
+    `;
+    return rows[0]?.discord_user_id ?? null;
+  }
+
+  async saveGithubConnection(connection: Omit<GithubConnection, "updatedAt">) {
+    const saved = { ...connection, updatedAt: new Date() };
+    if (!this.sql) {
+      this.githubConnections.set(connection.discordUserId, saved);
+      return;
+    }
+    await this.sql`
+      insert into github_connections (
+        discord_user_id, github_user_id, github_login, access_token_encrypted,
+        refresh_token_encrypted, access_token_expires_at, refresh_token_expires_at
+      ) values (
+        ${connection.discordUserId}, ${connection.githubUserId}, ${connection.githubLogin},
+        ${connection.accessTokenEncrypted}, ${connection.refreshTokenEncrypted},
+        ${connection.accessTokenExpiresAt}, ${connection.refreshTokenExpiresAt}
+      )
+      on conflict (discord_user_id) do update set
+        github_user_id = excluded.github_user_id,
+        github_login = excluded.github_login,
+        access_token_encrypted = excluded.access_token_encrypted,
+        refresh_token_encrypted = excluded.refresh_token_encrypted,
+        access_token_expires_at = excluded.access_token_expires_at,
+        refresh_token_expires_at = excluded.refresh_token_expires_at,
+        updated_at = now()
+    `;
+  }
+
+  async getGithubConnection(discordUserId: string): Promise<GithubConnection | null> {
+    if (!this.sql) return this.githubConnections.get(discordUserId) ?? null;
+    const rows = await this.sql<{
+      discord_user_id: string;
+      github_user_id: string;
+      github_login: string;
+      access_token_encrypted: string;
+      refresh_token_encrypted: string | null;
+      access_token_expires_at: Date | null;
+      refresh_token_expires_at: Date | null;
+      updated_at: Date;
+    }[]>`select * from github_connections where discord_user_id = ${discordUserId}`;
+    const row = rows[0];
+    return row ? {
+      discordUserId: row.discord_user_id,
+      githubUserId: row.github_user_id,
+      githubLogin: row.github_login,
+      accessTokenEncrypted: row.access_token_encrypted,
+      refreshTokenEncrypted: row.refresh_token_encrypted,
+      accessTokenExpiresAt: row.access_token_expires_at,
+      refreshTokenExpiresAt: row.refresh_token_expires_at,
+      updatedAt: row.updated_at
+    } : null;
+  }
+
+  async deleteGithubConnection(discordUserId: string) {
+    if (!this.sql) {
+      this.githubConnections.delete(discordUserId);
+      return;
+    }
+    await this.sql`delete from github_connections where discord_user_id = ${discordUserId}`;
   }
 
   async healthCheck(): Promise<{ ok: boolean; mode: "postgres" | "memory"; latencyMs: number; error?: string }> {

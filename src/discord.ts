@@ -20,6 +20,14 @@ import { parseAgentActions, type GeneratedFile } from "./agent-actions.js";
 import { agents, selectAgents, type Agent } from "./agents.js";
 import { formatBountyRun, getBountyStatus, startBountyScan } from "./bounty.js";
 import { config } from "./config.js";
+import {
+  createGithubConnectUrl,
+  disconnectGithub,
+  githubConnectionStatus,
+  githubInstallUrl,
+  githubIsConfigured,
+  listGithubRepositories
+} from "./github.js";
 import { askAgent } from "./openrouter.js";
 import { Store } from "./store.js";
 
@@ -77,7 +85,7 @@ export function createDiscordClient(store: Store) {
   });
 
   client.on("interactionCreate", (interaction) => {
-    void handleSettingsInteraction(interaction, store).catch(async (error) => {
+    void handleInteraction(interaction, store).catch(async (error) => {
       console.error("Settings interaction failed", error);
       const content = `Не удалось применить настройку: ${errorMessage(error)}`;
       if (interaction.isRepliable()) {
@@ -141,6 +149,10 @@ async function handleCommand(message: Message, store: Store) {
       return;
     }
     await message.reply(await buildSettingsPanel(store));
+    return;
+  }
+  if (command === "github" || command === "gh") {
+    await handleGithubCommand(message, store, rest);
     return;
   }
   if (command === "status") {
@@ -215,7 +227,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "help") {
     await message.reply(
-      "Команды: `!discuss <тема>`, `!stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
+      "Команды: `!discuss <тема>`, `!stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
     );
     return;
   }
@@ -291,6 +303,74 @@ async function handleCommand(message: Message, store: Store) {
     return;
   }
   await message.reply("Неизвестная команда. Используй `!help`, чтобы посмотреть доступные команды.");
+}
+
+async function handleGithubCommand(message: Message, store: Store, args: string[]) {
+  if (!githubIsConfigured()) {
+    await message.reply("Интеграция GitHub ещё не настроена на Render.");
+    return;
+  }
+  const action = args[0]?.toLowerCase() || "status";
+  if (action === "connect" || action === "подключить") {
+    const current = await githubConnectionStatus(store, message.author.id);
+    const url = await createGithubConnectUrl(store, message.author.id);
+    const delivered = await sendGithubPrivateMessage(message, {
+      content: `${current ? `Сейчас подключён GitHub **@${current.githubLogin}**. Новая авторизация заменит эту привязку.\n` : ""}Открой персональную ссылку в течение 10 минут:\n${url}\n\nARGUS запомнит связь с Discord-пользователем **${message.author.username}**. Не пересылай эту одноразовую ссылку другим.`,
+      allowedMentions: { parse: [] }
+    });
+    if (delivered) await message.reply("Персональная ссылка подключения GitHub отправлена тебе в личные сообщения.");
+    return;
+  }
+  if (action === "repos" || action === "repositories" || action === "репозитории") {
+    try {
+      const repositories = await listGithubRepositories(store, message.author.id);
+      if (!repositories.length) {
+        const install = githubInstallUrl();
+        const delivered = await sendGithubPrivateMessage(message, { content: `GitHub подключён, но ARGUS не видит установок или разрешённых репозиториев.${install ? `\nУстановить приложение и выбрать репозитории: ${install}` : ""}` });
+        if (delivered) await message.reply("Результат проверки GitHub отправлен тебе в личные сообщения.");
+        return;
+      }
+      const shown = repositories.slice(0, 20);
+      const lines = shown.map((repo) => `${repo.private ? "🔒" : "🌐"} [${repo.full_name}](<${repo.html_url}>) · ветка \`${repo.default_branch}\``);
+      if (repositories.length > shown.length) lines.push(`…и ещё ${repositories.length - shown.length}.`);
+      const delivered = await sendGithubPrivateMessage(message, { content: `Репозитории, разрешённые GitHub App:\n${lines.join("\n")}`, allowedMentions: { parse: [] } });
+      if (delivered) await message.reply("Список разрешённых репозиториев отправлен тебе в личные сообщения.");
+    } catch (error) {
+      await message.reply(`Не удалось получить репозитории: ${errorMessage(error)}`);
+    }
+    return;
+  }
+  if (action === "disconnect" || action === "отвязать") {
+    const current = await githubConnectionStatus(store, message.author.id);
+    if (!current) {
+      await message.reply("GitHub не подключён.");
+      return;
+    }
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`github:disconnect:${message.author.id}`).setLabel(`Отвязать @${current.githubLogin}`).setStyle(ButtonStyle.Danger)
+    );
+    const delivered = await sendGithubPrivateMessage(message, { content: "ARGUS удалит сохранённые токены и попытается отозвать авторизацию на GitHub. Установка GitHub App в выбранных репозиториях останется, пока ты отдельно не удалишь её в GitHub.", components: [row] });
+    if (delivered) await message.reply("Подтверждение отвязки GitHub отправлено тебе в личные сообщения.");
+    return;
+  }
+  const current = await githubConnectionStatus(store, message.author.id);
+  if (!current) {
+    await message.reply("GitHub не подключён. Используй `!github connect`.");
+    return;
+  }
+  const delivered = await sendGithubPrivateMessage(message, { content: `Подключён GitHub **@${current.githubLogin}**.\nКоманды: \`!github repos\`, \`!github disconnect\`.` });
+  if (delivered) await message.reply("Статус GitHub отправлен тебе в личные сообщения.");
+}
+
+async function sendGithubPrivateMessage(message: Message, payload: Parameters<Message["author"]["send"]>[0]): Promise<boolean> {
+  try {
+    await message.author.send(payload);
+    return true;
+  } catch (error) {
+    console.warn(`Cannot send GitHub details to Discord user ${message.author.id}`, error);
+    await message.reply("Не удалось отправить личное сообщение. Разреши Direct Messages from server members и повтори команду.");
+    return false;
+  }
 }
 
 function isController(message: Message) {
@@ -627,6 +707,34 @@ async function buildSettingsPanel(store: Store) {
     ],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select), buttons]
   };
+}
+
+async function handleInteraction(interaction: Interaction, store: Store) {
+  if (await handleGithubInteraction(interaction, store)) return;
+  await handleSettingsInteraction(interaction, store);
+}
+
+async function handleGithubInteraction(interaction: Interaction, store: Store): Promise<boolean> {
+  if (!interaction.isButton() || !interaction.customId.startsWith("github:")) return false;
+  const [, action, ownerId] = interaction.customId.split(":");
+  if (ownerId !== interaction.user.id) {
+    await interaction.reply({ content: "Эта кнопка относится к GitHub-подключению другого пользователя.", ephemeral: true });
+    return true;
+  }
+  if (action === "disconnect") {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const result = await disconnectGithub(store, interaction.user.id);
+      const remote = result.revoked
+        ? "Авторизация также отозвана на GitHub."
+        : "Локальные токены удалены, но GitHub не подтвердил удалённый отзыв. Проверь Authorized GitHub Apps в настройках GitHub.";
+      await interaction.editReply(`GitHub **@${result.login}** отвязан от Discord-пользователя. ${remote}`);
+      if (interaction.message.editable) await interaction.message.edit({ components: [] }).catch(() => undefined);
+    } catch (error) {
+      await interaction.editReply(`Не удалось отвязать GitHub: ${errorMessage(error)}`);
+    }
+  }
+  return true;
 }
 
 async function handleSettingsInteraction(interaction: Interaction, store: Store) {

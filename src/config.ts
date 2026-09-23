@@ -27,6 +27,11 @@ const schema = z.object({
   CREATIVE_MODEL: z.string().optional(),
   RESEARCHER_MODEL: z.string().optional(),
   COORDINATOR_MODEL: z.string().optional(),
+  GITHUB_CLIENT_ID: z.string().optional(),
+  GITHUB_CLIENT_SECRET: z.string().optional(),
+  GITHUB_APP_SLUG: z.string().optional(),
+  GITHUB_CALLBACK_URL: z.preprocess((value) => value === "" ? undefined : value, z.string().url().optional()),
+  GITHUB_TOKEN_ENCRYPTION_KEY: z.string().optional(),
   MAX_AGENT_REPLIES: z.coerce.number().int().min(1).max(10).default(5),
   MAX_CONTEXT_MESSAGES: z.coerce.number().int().min(4).max(100).default(20),
   DAILY_REQUEST_LIMIT: z.coerce.number().int().positive().default(100),
@@ -42,10 +47,26 @@ if (!result.success) {
 
 const env = result.data;
 
+const githubValues = [env.GITHUB_CLIENT_ID, env.GITHUB_CLIENT_SECRET, env.GITHUB_APP_SLUG, env.GITHUB_TOKEN_ENCRYPTION_KEY];
+const githubConfigured = githubValues.every(Boolean);
+if (githubValues.some(Boolean) && !githubConfigured) {
+  console.error("GitHub integration requires GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_APP_SLUG and GITHUB_TOKEN_ENCRYPTION_KEY together");
+  process.exit(1);
+}
+if (githubConfigured) {
+  const rawKey = env.GITHUB_TOKEN_ENCRYPTION_KEY!;
+  const decodedKey = /^[0-9a-f]{64}$/i.test(rawKey) ? Buffer.from(rawKey, "hex") : Buffer.from(rawKey, "base64");
+  if (decodedKey.length !== 32) {
+    console.error("GITHUB_TOKEN_ENCRYPTION_KEY must contain exactly 32 random bytes encoded as base64 or hex");
+    process.exit(1);
+  }
+}
+
 export const config = {
   ...env,
   allowedChannelIds: new Set(env.ALLOWED_CHANNEL_IDS.split(",").map((v) => v.trim()).filter(Boolean)),
   ownerIds: new Set(env.OWNER_IDS.split(",").map((v) => v.trim()).filter(Boolean)),
+  githubConfigured,
   agentChannelIds: {
     programmer: env.PROGRAMMER_CHANNEL_ID,
     engineer: env.ENGINEER_CHANNEL_ID,

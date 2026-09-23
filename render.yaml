@@ -21,6 +21,16 @@ services:
         sync: false
       - key: BOUNTY_MONITOR_TOKEN
         sync: false
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      - key: GITHUB_APP_SLUG
+        sync: false
+      - key: GITHUB_CALLBACK_URL
+        sync: false
+      - key: GITHUB_TOKEN_ENCRYPTION_KEY
+        sync: false
       - key: DEFAULT_MODEL
         value: openrouter/auto
       - key: AUTONOMOUS_ENABLED
