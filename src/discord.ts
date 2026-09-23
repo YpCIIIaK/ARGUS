@@ -31,6 +31,7 @@ const maxDelegationsPerRun = 5;
 const maxDelegationDepth = 3;
 
 type AgentExecution = { agent: Agent; content: string; files: GeneratedFile[] };
+type WorkflowResult = { content: string; files: GeneratedFile[] };
 type WorkflowState = {
   delegations: number;
   seen: Set<string>;
@@ -316,7 +317,7 @@ async function runDiscussion(
     for (const agent of candidates) {
       if (controller.signal.aborted) break;
       try {
-        const executions = await executeAgentWorkflow({
+        await executeAgentWorkflow({
           message,
           store,
           agent,
@@ -326,23 +327,9 @@ async function runDiscussion(
           depth: 0,
           state,
           signal: controller.signal,
-          updateProgress: () => updateWorkflowProgress(progressMessage, state)
+          updateProgress: () => updateWorkflowProgress(progressMessage, state),
+          emit: (execution) => publishAgentExecution(message, store, execution)
         });
-        for (const execution of executions) {
-          let storedMessageId: string | undefined;
-          if (execution.content && execution.content !== "[PASS]" && !execution.content.startsWith("[PASS]")) {
-            const sent = await sendAsAgent(message.channel as TextChannel, execution.agent, execution.content);
-            storedMessageId = sent.id;
-            await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: execution.agent.name, content: execution.content });
-          }
-          for (const file of execution.files) {
-            const sent = await sendGeneratedFile(message.channel as TextChannel, execution.agent, file);
-            if (!storedMessageId) {
-              storedMessageId = sent.id;
-              await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: execution.agent.name, content: `Создан файл: ${file.name}` });
-            }
-          }
-        }
       } catch (error) {
         if (error instanceof DailyLimitError) {
           await message.reply("Достигнут дневной лимит запросов к моделям.");
@@ -380,14 +367,16 @@ async function executeAgentWorkflow(input: {
   state: WorkflowState;
   signal: AbortSignal;
   updateProgress: () => Promise<void>;
-}): Promise<AgentExecution[]> {
-  const { message, store, agent, task, originalRequest, extraContext, depth, state, signal, updateProgress } = input;
-  if (signal.aborted) return [];
+  emit: (execution: AgentExecution) => Promise<void>;
+  requestedBy?: Agent;
+}): Promise<WorkflowResult> {
+  const { message, store, agent, task, originalRequest, extraContext, depth, state, signal, updateProgress, emit, requestedBy } = input;
+  if (signal.aborted) return { content: "", files: [] };
   const signature = `${agent.id}:${task.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 500)}`;
   if (state.seen.has(signature)) {
     state.progress.push(`↩️ ${agent.emoji} ${agent.name}: повторная подзадача пропущена`);
     await updateProgress();
-    return [];
+    return { content: "", files: [] };
   }
   state.seen.add(signature);
   state.progress.push(`⏳ ${agent.emoji} ${agent.name}: работает`);
@@ -408,11 +397,14 @@ async function executeAgentWorkflow(input: {
   await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
 
   const parsed = parseAgentActions(result.content, agent);
-  const executions: AgentExecution[] = [];
-  if (parsed.content || parsed.files.length) executions.push({ agent: configuredAgent, content: parsed.content, files: parsed.files });
+  const visibleContent = requestedBy && (parsed.content || parsed.files.length)
+    ? `↩️ **@${requestedBy.name}**, ${parsed.content || "запрошенные файлы готовы."}`
+    : parsed.content;
+  if (visibleContent || parsed.files.length) await emit({ agent: configuredAgent, content: visibleContent, files: parsed.files });
   markProgressDone(state, agent, parsed.delegations.length);
   await updateProgress();
 
+  const helperResults: Array<{ agent: Agent; result: WorkflowResult }> = [];
   for (const delegation of parsed.delegations) {
     if (signal.aborted || state.delegations >= maxDelegationsPerRun || depth >= maxDelegationDepth) break;
     const target = agents.find((item) => item.id === delegation.agentId);
@@ -420,14 +412,83 @@ async function executeAgentWorkflow(input: {
     state.delegations += 1;
     state.progress.push(`➡️ ${agent.name} → ${target.name}: ${delegation.task.slice(0, 100)}`);
     await updateProgress();
-    executions.push(...await executeAgentWorkflow({
+    await emit({
+      agent: configuredAgent,
+      content: `📨 **@${target.name}**, нужна помощь:\n> ${delegation.task}`,
+      files: []
+    });
+    const helperResult = await executeAgentWorkflow({
       ...input,
       agent: target,
       task: `Запрос от агента «${agent.name}»: ${delegation.task}`,
-      depth: depth + 1
-    }));
+      depth: depth + 1,
+      requestedBy: configuredAgent
+    });
+    helperResults.push({ agent: target, result: helperResult });
   }
-  return executions;
+
+  if (helperResults.length && !signal.aborted) {
+    state.progress.push(`📬 ${agent.emoji} ${agent.name}: получил результаты и готовит итог`);
+    await updateProgress();
+    const final = await resumeAfterDelegation({
+      message,
+      store,
+      agent: configuredAgent,
+      originalRequest,
+      helperResults,
+      context,
+      signal
+    });
+    if (final.content || final.files.length) await emit({ agent: configuredAgent, ...final });
+    state.progress.push(`✅ ${agent.emoji} ${agent.name}: вернул итог пользователю`);
+    await updateProgress();
+    return {
+      content: [parsed.content, ...helperResults.map((item) => item.result.content), final.content].filter(Boolean).join("\n"),
+      files: [...parsed.files, ...helperResults.flatMap((item) => item.result.files), ...final.files]
+    };
+  }
+  return { content: parsed.content, files: parsed.files };
+}
+
+async function resumeAfterDelegation(input: {
+  message: Message;
+  store: Store;
+  agent: Agent;
+  originalRequest: string;
+  helperResults: Array<{ agent: Agent; result: WorkflowResult }>;
+  context: Array<{ author: string; content: string }>;
+  signal: AbortSignal;
+}): Promise<WorkflowResult> {
+  const { message, store, agent, originalRequest, helperResults, context, signal } = input;
+  const dailyLimit = store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT);
+  if (!(await store.consumeRequest(dailyLimit))) {
+    return { content: "Помощники завершили работу, но дневной лимит не позволил сформировать дополнительный итог.", files: [] };
+  }
+  const reports = helperResults.map(({ agent: helper, result }) => {
+    const fileNames = result.files.map((file) => file.name).join(", ") || "нет";
+    return `${helper.name}:\n${result.content || "Ответ без текста"}\nСозданные файлы: ${fileNames}`;
+  }).join("\n\n").slice(0, 20_000);
+  const result = await askAgent(
+    agent,
+    context,
+    `Помощники завершили подзадачи. Их ответы:\n\n${reports}\n\nИсходная задача пользователя:\n${originalRequest}\n\nТеперь ответь пользователю от своего имени: кратко подведи итог, укажи созданные файлы и не запрашивай новую помощь. Не используй служебные блоки DELEGATE.`,
+    store.getNumberSetting("max_output_tokens", 30_000),
+    signal
+  );
+  await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
+  const parsed = parseAgentActions(result.content, agent);
+  return { content: `📬 **Результаты помощников получены.**\n${parsed.content}`, files: parsed.files };
+}
+
+async function publishAgentExecution(message: Message, store: Store, execution: AgentExecution) {
+  if (execution.content && execution.content !== "[PASS]" && !execution.content.startsWith("[PASS]")) {
+    const sent = await sendAsAgent(message.channel as TextChannel, execution.agent, execution.content);
+    await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: execution.agent.name, content: execution.content });
+  }
+  for (const file of execution.files) {
+    const sent = await sendGeneratedFile(message.channel as TextChannel, execution.agent, file);
+    await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: execution.agent.name, content: `Создан файл: ${file.name}` });
+  }
 }
 
 function workflowRequest(agent: Agent, task: string, originalRequest: string, depth: number): string {
