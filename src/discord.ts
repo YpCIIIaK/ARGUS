@@ -137,7 +137,8 @@ async function handleCommand(message: Message, store: Store) {
       await message.reply(await formatChannelStatus(store, message.channelId, channelAgent));
       return;
     }
-    await message.reply(`Состояние: **${(await store.isPaused()) ? "пауза" : "активно"}**\nЗапросов к моделям сегодня: **${store.getRequestsToday()} / ${config.DAILY_REQUEST_LIMIT}**`);
+    const dailyLimit = store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT);
+    await message.reply(`Состояние: **${(await store.isPaused()) ? "пауза" : "активно"}**\nЗапросов к моделям сегодня: **${await store.getRequestsToday()} / ${dailyLimit}**`);
     return;
   }
   if (command === "context" || command === "session") {
@@ -179,7 +180,7 @@ async function handleCommand(message: Message, store: Store) {
       await message.reply("Контекст пока пуст — компактировать нечего.");
       return;
     }
-    if (!store.consumeRequest()) {
+    if (!(await store.consumeRequest(store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT)))) {
       await message.reply("Достигнут дневной лимит запросов к моделям.");
       return;
     }
@@ -302,7 +303,7 @@ async function runDiscussion(
     await (message.channel as TextChannel).sendTyping();
     for (const agent of candidates) {
       if (controller.signal.aborted) break;
-      if (!store.consumeRequest()) {
+      if (!(await store.consumeRequest(store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT)))) {
         await message.reply("Достигнут дневной лимит запросов к моделям.");
         break;
       }
@@ -507,7 +508,7 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
       await interaction.reply({ content: "Контекст пока пуст — компактировать нечего.", ephemeral: true });
       return;
     }
-    if (!store.consumeRequest()) {
+    if (!(await store.consumeRequest(store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT)))) {
       await interaction.reply({ content: "Достигнут дневной лимит запросов к моделям.", ephemeral: true });
       return;
     }

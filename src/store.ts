@@ -282,19 +282,39 @@ export class Store {
     `;
   }
 
-  consumeRequest(): boolean {
+  async consumeRequest(limit: number): Promise<boolean> {
     const today = new Date().toISOString().slice(0, 10);
-    if (today !== this.requestDay) {
-      this.requestDay = today;
-      this.requestsToday = 0;
+    if (!this.sql) {
+      if (today !== this.requestDay) {
+        this.requestDay = today;
+        this.requestsToday = 0;
+      }
+      if (this.requestsToday >= limit) return false;
+      this.requestsToday += 1;
+      return true;
     }
-    if (this.requestsToday >= this.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT)) return false;
-    this.requestsToday += 1;
-    return true;
+
+    const key = `request_count:${today}`;
+    const rows = await this.sql<{ value: string }[]>`
+      insert into app_state (key, value) values (${key}, '1')
+      on conflict (key) do update
+        set value = (app_state.value::integer + 1)::text, updated_at = now()
+        where app_state.value::integer < ${limit}
+      returning value
+    `;
+    return rows.length === 1;
   }
 
-  getRequestsToday() {
-    return this.requestsToday;
+  async getRequestsToday(): Promise<number> {
+    const today = new Date().toISOString().slice(0, 10);
+    if (!this.sql) {
+      if (today !== this.requestDay) return 0;
+      return this.requestsToday;
+    }
+    const rows = await this.sql<{ value: string }[]>`
+      select value from app_state where key = ${`request_count:${today}`}
+    `;
+    return Number(rows[0]?.value ?? 0);
   }
 }
 
