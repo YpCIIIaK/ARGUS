@@ -404,6 +404,8 @@ function isInteractionController(interaction: Interaction): boolean {
 }
 
 async function buildSettingsPanel(store: Store) {
+  const dailyLimit = store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT);
+  const requestsToday = await store.getRequestsToday();
   const select = new StringSelectMenuBuilder()
     .setCustomId("settings:agent")
     .setPlaceholder("Выбрать агента")
@@ -421,7 +423,11 @@ async function buildSettingsPanel(store: Store) {
     embeds: [
       new EmbedBuilder()
         .setTitle("⚙️ Настройки ARGUS")
-        .setDescription("Выбери агента, чтобы изменить его модель или контекст. Общие лимиты действуют на весь сервер.")
+        .setDescription("Выбери агента, чтобы изменить его модель или контекст. Кнопка «Общие лимиты» меняет ограничения сразу для всего сервера.")
+        .addFields({
+          name: "Дневной лимит OpenRouter",
+          value: `Использовано **${requestsToday} / ${dailyLimit}** запросов. Счётчик сбрасывается в 00:00 UTC. Один вызов одного агента считается одним запросом; внутренние повторы при временной ошибке отдельно не считаются.`
+        })
         .setColor(0x5865f2)
     ],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select), buttons]
@@ -559,7 +565,7 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
       store.setSetting("daily_request_limit", String(dailyLimit)),
       store.setSetting("max_output_tokens", String(maxTokens))
     ]);
-    await interaction.reply({ content: `Лимиты сохранены: ответов за раунд ${maxReplies}, запросов в день ${dailyLimit}, токенов ответа ${maxTokens.toLocaleString("ru-RU")}.`, ephemeral: true });
+    await interaction.reply({ content: `Лимиты сохранены для всего сервера:\n• агентов за один раунд — **${maxReplies}**;\n• вызовов агентов в сутки — **${dailyLimit}**;\n• максимум токенов одного ответа агента — **${maxTokens.toLocaleString("ru-RU")}**.`, ephemeral: true });
   }
 }
 
