@@ -13,6 +13,7 @@ type SandboxCommand = Awaited<ReturnType<SandboxSession["commands"]["runBackgrou
 export type SandboxStep = { command: string; output: string; ok: boolean; durationMs: number };
 export type SandboxRunResult = { sandboxId: string; output: string; durationMs: number; steps: SandboxStep[] };
 export type SandboxProgress = (event: { type: "started" | "finished"; command: string; output?: string; ok?: boolean; durationMs?: number }) => Promise<void> | void;
+export type PdfSandboxResult = { file: Uint8Array; run: SandboxRunResult };
 
 export function sandboxIsConfigured() { return Boolean(config.CSB_API_KEY); }
 
@@ -92,6 +93,53 @@ export async function runSandboxSmokeTest(signal?: AbortSignal): Promise<Sandbox
     return [{ command: "node check.mjs", output: result.output, ok: result.ok, durationMs: Date.now() - startedAt }];
   });
 }
+
+export async function runPdfSandbox(markdown: string, signal?: AbortSignal): Promise<PdfSandboxResult> {
+  let pdf = new Uint8Array();
+  const runResult = await withSandbox("ARGUS PDF", 5 * 60_000, signal, async (session, run) => {
+    const directory = "/project/sandbox/argus-pdf";
+    await session.fs.mkdir(directory, true);
+    await session.fs.writeTextFile(`${directory}/content.json`, JSON.stringify({ markdown }));
+    await session.fs.writeTextFile(`${directory}/render.mjs`, pdfRendererSource);
+    const steps: SandboxStep[] = [];
+    for (const command of ["npm init -y && npm install pdfkit@0.17.2", "node render.mjs"]) {
+      const startedAt = Date.now();
+      const result = await run(command, directory);
+      steps.push({ command, output: result.output, ok: result.ok, durationMs: Date.now() - startedAt });
+      if (!result.ok) return steps;
+    }
+    pdf = await session.fs.readFile(`${directory}/result.pdf`);
+    return steps;
+  });
+  if (!runResult.steps.every((step) => step.ok)) throw new Error(`Не удалось собрать PDF: ${runResult.output}`);
+  if (pdf.length < 5 || Buffer.from(pdf.slice(0, 5)).toString("ascii") !== "%PDF-") throw new Error("Песочница вернула некорректный PDF.");
+  if (pdf.length > 8_000_000) throw new Error("Готовый PDF превышает лимит 8 МБ.");
+  return { file: pdf, run: runResult };
+}
+
+const pdfRendererSource = `
+import fs from 'node:fs';
+import PDFDocument from 'pdfkit';
+const { markdown } = JSON.parse(fs.readFileSync('content.json', 'utf8'));
+const doc = new PDFDocument({ size: 'A4', margin: 54, info: { Title: 'ARGUS document', Creator: 'ARGUS' } });
+const output = fs.createWriteStream('result.pdf');
+doc.pipe(output);
+const font = ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf','/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf'].find(fs.existsSync);
+if (font) doc.font(font);
+for (const raw of String(markdown).split(/\\r?\\n/)) {
+  const line = raw.trimEnd();
+  if (/^# /.test(line)) { doc.moveDown(0.4).fontSize(20).text(line.slice(2)); doc.moveDown(0.4); }
+  else if (/^## /.test(line)) { doc.moveDown(0.3).fontSize(16).text(line.slice(3)); doc.moveDown(0.25); }
+  else if (/^### /.test(line)) { doc.moveDown(0.2).fontSize(13).text(line.slice(4)); }
+  else if (/^[-*] /.test(line)) { doc.fontSize(10.5).text('• ' + line.slice(2), { indent: 12, paragraphGap: 3 }); }
+  else if (!line.trim()) doc.moveDown(0.55);
+  else doc.fontSize(10.5).text(line.replace(/\\*\\*|__|\`/g, ''), { align: 'left', lineGap: 2, paragraphGap: 5 });
+}
+const completed = new Promise((resolve, reject) => { output.on('finish', resolve); output.on('error', reject); doc.on('error', reject); });
+doc.end();
+await completed;
+console.log('ARGUS_PDF_OK');
+`;
 
 async function withSandbox(title: string, timeoutMs: number, signal: AbortSignal | undefined,
   work: (session: SandboxSession, run: (command: string, cwd: string) => Promise<{ output: string; ok: boolean }>) => Promise<SandboxStep[]>

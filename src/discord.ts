@@ -41,7 +41,7 @@ import {
   selectedGithubRepository
 } from "./github.js";
 import { askAgent } from "./openrouter.js";
-import { runRepositorySandbox, runSandboxSmokeTest, sandboxIsConfigured, sandboxStatus, type SandboxRunResult } from "./sandbox.js";
+import { runPdfSandbox, runRepositorySandbox, runSandboxSmokeTest, sandboxIsConfigured, sandboxStatus, type SandboxRunResult } from "./sandbox.js";
 import { Store } from "./store.js";
 import { executeWebActions, webToolsConfigured } from "./web-tools.js";
 
@@ -618,10 +618,27 @@ async function executeAgentWorkflow(input: {
     await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
     parsed = parseAgentActions(result.content, agent);
   }
-  const visibleContent = requestedBy && (parsed.content || parsed.files.length)
+  const visibleContent = requestedBy && (parsed.content || parsed.files.length || parsed.pdfs.length)
     ? `↩️ **@${requestedBy.name}**, ${parsed.content || "запрошенные файлы готовы."}`
     : parsed.content;
   if (visibleContent || parsed.files.length) await emit({ agent: configuredAgent, content: visibleContent, files: parsed.files });
+  for (const pdf of parsed.pdfs) {
+    if (signal.aborted) break;
+    state.progress.push(`📄 ${agent.emoji} ${agent.name}: создаёт PDF в CodeSandbox`);
+    await updateProgress();
+    await message.reply(`📄 **${agent.name} → Песочница:** собираю **${pdf.name}** в изолированной VM…`);
+    try {
+      const generated = await runPdfSandbox(pdf.content, signal);
+      const sent = await (message.channel as TextChannel).send({
+        content: `✅ **Песочница → ${agent.name}:** PDF создан за **${(generated.run.durationMs / 1000).toFixed(1)} с**, VM остановлена.`,
+        files: [{ attachment: Buffer.from(generated.file), name: pdf.name }],
+        allowedMentions: { parse: [] }
+      });
+      await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: `Создан PDF: ${pdf.name}` });
+    } catch (error) {
+      await message.reply(`Не удалось создать PDF **${pdf.name}**: ${errorMessage(error)}`);
+    }
+  }
   if (parsed.githubChanges.length) {
     try {
       const pending = await prepareGithubFileChanges(store, message.author.id, parsed.githubChanges);
@@ -733,6 +750,9 @@ function workflowRequest(agent: Agent, task: string, originalRequest: string, de
   const createFileProtocol = agent.capabilities.includes("create_file")
     ? `\nТы можешь создать файл. Для этого выведи блок:\n[CREATE_FILE name="filename.ext"]\nполное содержимое\n[/CREATE_FILE]\nПосле блока кратко объясни, что создано.`
     : "";
+  const createPdfProtocol = agent.capabilities.includes("create_pdf")
+    ? `\nТы можешь создать настоящий PDF через изолированную CodeSandbox VM. Подготовь содержимое в Markdown и выведи блок:\n[CREATE_PDF name="article.pdf"]\n# Заголовок\nПолный текст документа со ссылками и разделами.\n[/CREATE_PDF]\nНе утверждай, что PDF создан, пока инструмент не вернул файл.`
+    : "";
   const githubProtocol = agent.capabilities.includes("github_files") && githubRepo
     ? `\nВыбран GitHub-репозиторий ${githubRepo}. Перед изменением существующего файла запроси его содержимое блоком [GITHUB_READ path="src/file.ts"][/GITHUB_READ]. За один запуск можно прочитать до пяти файлов. После чтения ты получишь их содержимое отдельным шагом. Ты можешь предложить создание или полную замену файла блоком:\n[GITHUB_FILE action="write" path="src/file.ts"]\nполное новое содержимое файла\n[/GITHUB_FILE]\nДля удаления используй:\n[GITHUB_FILE action="delete" path="old.txt"]\n[/GITHUB_FILE]\nКаждое изменение будет показано пользователю и применится только после кнопки подтверждения в отдельную ветку. Не заменяй существующий файл, пока не прочитал его полное содержимое.`
     : agent.capabilities.includes("github_files")
@@ -743,7 +763,7 @@ function workflowRequest(agent: Agent, task: string, originalRequest: string, de
     : agent.capabilities.includes("web_search")
       ? "\nВеб-инструмент пока не настроен: владельцу нужно добавить JINA_API_KEY в Render."
       : "";
-  return `ИСХОДНАЯ ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${originalRequest}\n\nТВОЯ ТЕКУЩАЯ ПОДЗАДАЧА (уровень ${depth}):\n${task}\n\nТвои возможности: ${own}.\nКоманда: ${roster}.\nЕсли для выполнения действительно нужна возможность другого агента, передай ему одну конкретную подзадачу точным блоком:\n[DELEGATE agent="programmer"]\nчто именно требуется сделать и какие данные использовать\n[/DELEGATE]\nМожно заменить programmer на engineer, creative, researcher или coordinator. Не делегируй то, что способен сделать сам. Не вызывай самого себя. Не утверждай, что помощник уже выполнил задачу.${createFileProtocol}${githubProtocol}${webProtocol}`;
+  return `ИСХОДНАЯ ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${originalRequest}\n\nТВОЯ ТЕКУЩАЯ ПОДЗАДАЧА (уровень ${depth}):\n${task}\n\nТвои возможности: ${own}.\nКоманда: ${roster}.\nЕсли для выполнения действительно нужна возможность другого агента, передай ему одну конкретную подзадачу точным блоком:\n[DELEGATE agent="programmer"]\nчто именно требуется сделать и какие данные использовать\n[/DELEGATE]\nМожно заменить programmer на engineer, creative, researcher или coordinator. Не делегируй то, что способен сделать сам. Не вызывай самого себя. Не утверждай, что помощник уже выполнил задачу.${createFileProtocol}${createPdfProtocol}${githubProtocol}${webProtocol}`;
 }
 
 async function sendGithubApproval(
@@ -844,6 +864,7 @@ function runtimeAgent(store: Store, agent: Agent): Agent {
 function capabilityLabel(capability: Agent["capabilities"][number]): string {
   return ({
     create_file: "создание файлов",
+    create_pdf: "создание PDF в песочнице",
     write_code: "написание кода",
     github_files: "файлы GitHub через подтверждение",
     web_search: "поиск в интернете",

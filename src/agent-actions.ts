@@ -3,18 +3,21 @@ import type { Agent, AgentId } from "./agents.js";
 const agentIds = new Set<AgentId>(["programmer", "engineer", "creative", "researcher", "coordinator"]);
 
 export type GeneratedFile = { name: string; content: string };
+export type GeneratedPdf = { name: string; content: string };
 export type GithubFileChange = { action: "write" | "delete"; path: string; content?: string };
 export type WebAction = { type: "search"; query: string } | { type: "read"; url: string };
 
 export function parseAgentActions(content: string, agent: Agent): {
   content: string;
   files: GeneratedFile[];
+  pdfs: GeneratedPdf[];
   delegations: Array<{ agentId: AgentId; task: string }>;
   githubChanges: GithubFileChange[];
   githubReads: string[];
   webActions: WebAction[];
 } {
   const files: GeneratedFile[] = [];
+  const pdfs: GeneratedPdf[] = [];
   const delegations: Array<{ agentId: AgentId; task: string }> = [];
   const githubChanges: GithubFileChange[] = [];
   const githubReads: string[] = [];
@@ -28,6 +31,18 @@ export function parseAgentActions(content: string, agent: Agent): {
         const name = safeFileName(rawName);
         const bytes = Buffer.byteLength(fileContent, "utf8");
         if (name && bytes > 0 && bytes <= 1_000_000) files.push({ name, content: fileContent });
+      }
+      return "";
+    }
+  );
+  visible = visible.replace(
+    /\[CREATE_PDF\s+name=["']?([^"'\]\r\n]+)["']?\]\s*([\s\S]*?)\s*\[\/CREATE_PDF\]/giu,
+    (_match, rawName: string, pdfContent: string) => {
+      if (agent.capabilities.includes("create_pdf") && pdfs.length < 2) {
+        const base = safeFileName(rawName);
+        const name = base ? (base.toLowerCase().endsWith(".pdf") ? base : `${base}.pdf`) : null;
+        const bytes = Buffer.byteLength(pdfContent, "utf8");
+        if (name && bytes > 0 && bytes <= 500_000) pdfs.push({ name, content: pdfContent.trim() });
       }
       return "";
     }
@@ -84,7 +99,7 @@ export function parseAgentActions(content: string, agent: Agent): {
       return "";
     }
   );
-  return { content: visible.trim(), files, delegations, githubChanges, githubReads, webActions };
+  return { content: visible.trim(), files, pdfs, delegations, githubChanges, githubReads, webActions };
 }
 
 export function safePublicUrl(raw: string): string | null {

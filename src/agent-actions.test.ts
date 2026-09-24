@@ -27,6 +27,12 @@ test("agent without the capability cannot create files but can delegate", () => 
   assert.deepEqual(parsed.delegations, [{ agentId: "programmer", task: "Создай report.md" }]);
 });
 
+test("programmer can request a PDF artifact with a safe name", () => {
+  const programmer = mockAgent("programmer", ["create_pdf"]);
+  const parsed = parseAgentActions('[CREATE_PDF name="../report"]\n# Отчёт\nПроверенный текст\n[/CREATE_PDF]', programmer);
+  assert.deepEqual(parsed.pdfs, [{ name: "report.pdf", content: "# Отчёт\nПроверенный текст" }]);
+});
+
 test("unknown agents and empty delegation tasks are ignored", () => {
   const coordinator = mockAgent("coordinator", ["coordination"]);
   const parsed = parseAgentActions(
