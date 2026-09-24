@@ -21,6 +21,7 @@ import { parseAgentActions, type GeneratedFile } from "./agent-actions.js";
 import { agents, selectAgents, type Agent } from "./agents.js";
 import { formatBountyRun, getBountyStatus, startBountyScan } from "./bounty.js";
 import { config } from "./config.js";
+import { routeRequest } from "./decision-engine.js";
 import {
   applyGithubFileChanges,
   cancelGithubFileChanges,
@@ -136,7 +137,14 @@ async function handleMessage(message: Message, store: Store) {
     content: text
   });
   const channelAgent = agentForChannel(message);
-  await runDiscussion(message, store, channelAgent ? [channelAgent] : selectAgents(text), text);
+  if (channelAgent) await runDiscussion(message, store, [channelAgent], text);
+  else {
+    const routed = await routeRequest(text);
+    const names = routed.selected.map((agent) => agent.name).join(", ");
+    const provider = routed.decision.source === "model" ? `модель **${routed.decision.model}**` : routed.decision.source === "rules" ? "правила" : "резервный подбор";
+    await message.reply(`🧭 **ARGUS Router → ${names}** · ${provider} · уверенность **${Math.round(routed.decision.confidence * 100)}%**\n${routed.decision.reason}${routed.decision.tool !== "none" ? `\nИнструмент: **${routed.decision.tool}**` : ""}`);
+    await runDiscussion(message, store, routed.selected, text);
+  }
 }
 
 async function handleCommand(message: Message, store: Store) {
@@ -252,6 +260,10 @@ async function handleCommand(message: Message, store: Store) {
     await sendLong(message.channel as TextChannel, tasks.map((task) => `${icon[task.status]} **${task.requestedBy} → ${task.assignedTo}** · ID **${task.id.slice(0, 8)}**\n${task.description.slice(0, 300)}`).join("\n\n"));
     return;
   }
+  if (command === "router") {
+    await message.reply(`ARGUS Decision Engine: **${config.ROUTER_ENABLED ? "включён" : "выключен"}**\nПорядок моделей:\n${config.routerModels.map((model, index) => `${index + 1}. **${model}**`).join("\n")}\nОчевидные запросы обрабатываются локальными правилами без расхода API.`);
+    return;
+  }
   if (command === "context" || command === "session") {
     if (!channelAgent) {
       await message.reply("Эта команда предназначена для персонального канала агента.");
@@ -315,7 +327,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "help") {
     await message.reply(
-      "Команды: `!discuss <тема>`, `!tasks`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
+      "Команды: `!discuss <тема>`, `!tasks`, `!router`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
     );
     return;
   }

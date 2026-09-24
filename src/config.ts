@@ -46,6 +46,8 @@ const schema = z.object({
   SEARXNG_URL: z.string().optional(),
   SEARXNG_TOKEN: z.string().optional(),
   CSB_API_KEY: z.string().optional(),
+  ROUTER_ENABLED: z.enum(["true", "false"]).default("true").transform((value) => value === "true"),
+  ROUTER_MODELS: z.string().default("nex-agi/nex-n2.5-mini:free,inclusionai/ling-3.0-flash-sante:free,qwen/qwen3.8-27b:free,nvidia/nemotron-3.5-lightning:free,poolside/laguna-s-2.1:free"),
   MAX_AGENT_REPLIES: z.coerce.number().int().min(1).max(10).default(5),
   MAX_CONTEXT_MESSAGES: z.coerce.number().int().min(4).max(100).default(20),
   DAILY_REQUEST_LIMIT: z.coerce.number().int().positive().default(100),
@@ -85,6 +87,7 @@ export const config = {
   allowedChannelIds: new Set(env.ALLOWED_CHANNEL_IDS.split(",").map((v) => v.trim()).filter(Boolean)),
   ownerIds: new Set(env.OWNER_IDS.split(",").map((v) => v.trim()).filter(Boolean)),
   githubConfigured,
+  routerModels: env.ROUTER_MODELS.split(",").map((value) => value.trim()).filter(Boolean),
   agentChannelIds: {
     programmer: env.PROGRAMMER_CHANNEL_ID,
     engineer: env.ENGINEER_CHANNEL_ID,

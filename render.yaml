@@ -25,6 +25,8 @@ services:
         sync: false
       - key: CSB_API_KEY
         sync: false
+      - key: ROUTER_ENABLED
+        value: "true"
       - key: SEARXNG_URL
         value: https://argus-search.onrender.com
       - fromGroup: argus-search-auth
