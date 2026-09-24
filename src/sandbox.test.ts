@@ -4,7 +4,7 @@ import test from "node:test";
 process.env.DISCORD_TOKEN = "test-discord-token";
 process.env.OPENROUTER_API_KEY = "test-openrouter-key";
 
-const { detectProjectCommands } = await import("./sandbox.js");
+const { detectProjectCommands, generatePdf } = await import("./sandbox.js");
 const file = (path: string, content = "") => ({ path, content: Buffer.from(content) });
 
 test("detects npm checks from package scripts", () => {
@@ -28,4 +28,10 @@ test("detects Python tests and rejects unknown projects", () => {
     "python -m pip install -r requirements.txt", "python -m pytest -q"
   ]);
   assert.throws(() => detectProjectCommands([file("README.md")]), /Node\.js и Python/);
+});
+
+test("Render fallback creates a valid PDF with Cyrillic content", async () => {
+  const result = await generatePdf("# Проверка\n\nРусский текст\n\n- пункт");
+  assert.equal(Buffer.from(result.file.slice(0, 5)).toString("ascii"), "%PDF-");
+  assert.ok(result.file.length > 1_000);
 });

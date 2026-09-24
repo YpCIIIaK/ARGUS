@@ -1,4 +1,6 @@
 import { CodeSandbox } from "@codesandbox/sdk";
+import { fileURLToPath } from "node:url";
+import PDFDocument from "pdfkit";
 import { config } from "./config.js";
 import type { GithubRepositorySnapshot } from "./github.js";
 
@@ -14,6 +16,7 @@ export type SandboxStep = { command: string; output: string; ok: boolean; durati
 export type SandboxRunResult = { sandboxId: string; output: string; durationMs: number; steps: SandboxStep[] };
 export type SandboxProgress = (event: { type: "started" | "finished"; command: string; output?: string; ok?: boolean; durationMs?: number }) => Promise<void> | void;
 export type PdfSandboxResult = { file: Uint8Array; run: SandboxRunResult };
+export type PdfGenerationResult = { file: Uint8Array; durationMs: number; provider: "codesandbox" | "render"; fallbackReason?: string };
 
 export function sandboxIsConfigured() { return Boolean(config.CSB_API_KEY); }
 
@@ -115,6 +118,55 @@ export async function runPdfSandbox(markdown: string, signal?: AbortSignal): Pro
   if (pdf.length < 5 || Buffer.from(pdf.slice(0, 5)).toString("ascii") !== "%PDF-") throw new Error("Песочница вернула некорректный PDF.");
   if (pdf.length > 8_000_000) throw new Error("Готовый PDF превышает лимит 8 МБ.");
   return { file: pdf, run: runResult };
+}
+
+export async function generatePdf(markdown: string, signal?: AbortSignal): Promise<PdfGenerationResult> {
+  const startedAt = Date.now();
+  let fallbackReason: string | undefined;
+  if (sandboxIsConfigured()) {
+    try {
+      const result = await runPdfSandbox(markdown, signal);
+      return { file: result.file, durationMs: result.run.durationMs, provider: "codesandbox" };
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      fallbackReason = error instanceof Error ? error.message : String(error);
+      console.warn(`CodeSandbox PDF failed; using Render fallback: ${fallbackReason}`);
+    }
+  } else fallbackReason = "CodeSandbox не настроен";
+  const file = await renderPdfLocally(markdown, signal);
+  return { file, durationMs: Date.now() - startedAt, provider: "render", ...(fallbackReason ? { fallbackReason } : {}) };
+}
+
+async function renderPdfLocally(markdown: string, signal?: AbortSignal): Promise<Uint8Array> {
+  if (signal?.aborted) throw signal.reason ?? new Error("Операция остановлена");
+  const doc = new PDFDocument({ size: "A4", margin: 54, info: { Title: "ARGUS document", Creator: "ARGUS" } });
+  const chunks: Buffer[] = [];
+  doc.on("data", (chunk: Buffer) => chunks.push(chunk));
+  const completed = new Promise<Buffer>((resolve, reject) => {
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+  });
+  const fontRoot = new URL("../node_modules/dejavu-fonts-ttf/ttf/", import.meta.url);
+  doc.registerFont("Regular", fileURLToPath(new URL("DejaVuSans.ttf", fontRoot)));
+  doc.registerFont("Bold", fileURLToPath(new URL("DejaVuSans-Bold.ttf", fontRoot)));
+  doc.font("Regular");
+  writeMarkdownToPdf(doc, markdown);
+  doc.end();
+  const file = await completed;
+  if (file.length > 8_000_000) throw new Error("Готовый PDF превышает лимит 8 МБ.");
+  return file;
+}
+
+function writeMarkdownToPdf(doc: PDFKit.PDFDocument, markdown: string) {
+  for (const raw of markdown.split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    if (/^# /.test(line)) { doc.moveDown(0.4).font("Bold").fontSize(20).text(line.slice(2)); doc.font("Regular").moveDown(0.4); }
+    else if (/^## /.test(line)) { doc.moveDown(0.3).font("Bold").fontSize(16).text(line.slice(3)); doc.font("Regular").moveDown(0.25); }
+    else if (/^### /.test(line)) { doc.moveDown(0.2).font("Bold").fontSize(13).text(line.slice(4)); doc.font("Regular"); }
+    else if (/^[-*] /.test(line)) doc.fontSize(10.5).text(`• ${line.slice(2)}`, { indent: 12, paragraphGap: 3 });
+    else if (!line.trim()) doc.moveDown(0.55);
+    else doc.fontSize(10.5).text(line.replace(/\*\*|__|`/g, ""), { align: "left", lineGap: 2, paragraphGap: 5 });
+  }
 }
 
 const pdfRendererSource = `

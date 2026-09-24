@@ -41,7 +41,7 @@ import {
   selectedGithubRepository
 } from "./github.js";
 import { askAgent } from "./openrouter.js";
-import { runPdfSandbox, runRepositorySandbox, runSandboxSmokeTest, sandboxIsConfigured, sandboxStatus, type SandboxRunResult } from "./sandbox.js";
+import { generatePdf, runRepositorySandbox, runSandboxSmokeTest, sandboxIsConfigured, sandboxStatus, type SandboxRunResult } from "./sandbox.js";
 import { Store } from "./store.js";
 import { executeWebActions, webToolsConfigured } from "./web-tools.js";
 
@@ -757,9 +757,11 @@ async function publishGeneratedPdfs(
     await updateProgress?.();
     await message.reply(`📄 **${agent.name} → Песочница:** собираю **${pdf.name}** в изолированной VM…`);
     try {
-      const generated = await runPdfSandbox(pdf.content, signal);
+      const generated = await generatePdf(pdf.content, signal);
       const sent = await (message.channel as TextChannel).send({
-        content: `✅ **Песочница → ${agent.name}:** PDF создан за **${(generated.run.durationMs / 1000).toFixed(1)} с**, VM остановлена.`,
+        content: generated.provider === "codesandbox"
+          ? `✅ **Песочница → ${agent.name}:** PDF создан за **${(generated.durationMs / 1000).toFixed(1)} с**, VM остановлена.`
+          : `✅ **Render PDF → ${agent.name}:** PDF создан за **${(generated.durationMs / 1000).toFixed(1)} с**.${generated.fallbackReason ? " CodeSandbox недоступен, использован безопасный резерв." : ""}`,
         files: [{ attachment: Buffer.from(generated.file), name: pdf.name }],
         allowedMentions: { parse: [] }
       });
