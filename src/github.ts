@@ -18,10 +18,10 @@ type TokenResponse = {
 };
 
 type GithubUser = { id: number; login: string };
-type GithubInstallation = { id: number; account?: { login?: string }; repository_selection?: string };
+type GithubInstallation = { id: number; account?: { login?: string }; repository_selection?: string; permissions?: { contents?: string } };
 type GithubRepository = { id: number; full_name: string; private: boolean; html_url: string; default_branch: string };
 
-export type GithubRepo = GithubRepository & { installationId: number; account: string; selection: string };
+export type GithubRepo = GithubRepository & { installationId: number; account: string; selection: string; contentsPermission: string };
 type PendingGithubChange = { repo: string; changes: GithubFileChange[]; requestedAt: string; emptyRepository: boolean };
 class GithubApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -90,7 +90,8 @@ export async function listGithubRepositories(store: Store, discordUserId: string
         ...repository,
         installationId: installation.id,
         account: installation.account?.login || "unknown",
-        selection: installation.repository_selection || "selected"
+        selection: installation.repository_selection || "selected",
+        contentsPermission: installation.permissions?.contents || "none"
       });
     }
   }
@@ -120,6 +121,9 @@ export async function prepareGithubFileChanges(
   if (!repository) {
     await store.deleteSetting(`github_repo:${discordUserId}`);
     throw new Error("Ранее выбранный репозиторий больше недоступен. Выбери его заново.");
+  }
+  if (repository.contentsPermission !== "write") {
+    throw new Error("GitHub App установлена без подтверждённого права Contents: Read and write. Подтверди новые права в GitHub Installed Apps, затем переподключи аккаунт через `!github` → «Подключить».");
   }
   if (new Set(changes.map((change) => change.path)).size !== changes.length) throw new Error("Один файл нельзя изменять несколько раз в одном пакете.");
   const totalBytes = changes.reduce((sum, change) => sum + Buffer.byteLength(change.content || "", "utf8"), 0);
@@ -346,7 +350,16 @@ async function githubApiRequest<T = unknown>(path: string, token: string, init: 
     signal: AbortSignal.timeout(15_000)
   });
   const data = await response.json().catch(() => ({})) as T & { message?: string };
-  if (!response.ok) throw new GithubApiError(data.message || `GitHub API вернул ${response.status}`, response.status);
+  if (!response.ok) {
+    const acceptedPermissions = response.headers.get("x-accepted-github-permissions") || "";
+    if (response.status === 403 && /resource not accessible by integration/iu.test(data.message || "")) {
+      throw new GithubApiError(
+        `GitHub запретил запись приложению. Проверь Contents: Read and write, подтверди обновлённые права установленной GitHub App и заново выполни подключение.${acceptedPermissions ? ` Требуемые права: ${acceptedPermissions}.` : ""}`,
+        response.status
+      );
+    }
+    throw new GithubApiError(data.message || `GitHub API вернул ${response.status}`, response.status);
+  }
   return data;
 }
 

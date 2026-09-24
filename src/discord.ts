@@ -756,7 +756,7 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
         return true;
       }
       const shown = repositories.slice(0, 15);
-      const lines = shown.map((repo) => `${repo.private ? "🔒" : "🌐"} [${repo.full_name}](<${repo.html_url}>) · \`${repo.default_branch}\``);
+      const lines = shown.map((repo) => `${repo.private ? "🔒" : "🌐"} [${repo.full_name}](<${repo.html_url}>) · \`${repo.default_branch}\` · Contents: **${repo.contentsPermission}**`);
       if (repositories.length > shown.length) lines.push(`…и ещё ${repositories.length - shown.length}.`);
       const select = new StringSelectMenuBuilder()
         .setCustomId(`github:select_repo:${interaction.user.id}`)
