@@ -58,6 +58,11 @@ export async function askAgent(
   maxTokens = 30_000,
   signal?: AbortSignal
 ): Promise<AgentResponse> {
+  if (agent.model.toLowerCase().startsWith("claude-code/")) {
+    const { askClaudeCode } = await import("./claude-code.js");
+    return askClaudeCode(agent, context, currentRequest, maxTokens, signal);
+  }
+  if (!config.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is missing");
   const transcript = context.map((item) => `${item.author}: ${item.content}`).join("\n");
   const request = {
     method: "POST",

@@ -15,6 +15,7 @@
     "test": "tsx --test src/*.test.ts"
   },
   "dependencies": {
+    "@anthropic-ai/claude-code": "^2.1.281",
     "@codesandbox/sdk": "^1.1.6",
     "dejavu-fonts-ttf": "^2.37.3",
     "discord.js": "^14.22.1",

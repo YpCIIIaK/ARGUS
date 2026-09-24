@@ -64,7 +64,8 @@ export class Store {
       console.warn("DATABASE_URL is empty; using non-persistent in-memory storage");
       return;
     }
-    this.sql = postgres(config.DATABASE_URL, { ssl: "require", max: 3 });
+    const transactionPooler = isTransactionPooler(config.DATABASE_URL);
+    this.sql = postgres(config.DATABASE_URL, { ssl: "require", max: 3, prepare: !transactionPooler });
     await this.sql`
       create table if not exists messages (
         id bigserial primary key,
@@ -561,6 +562,14 @@ export class Store {
       select value from app_state where key = ${`request_count:${today}`}
     `;
     return Number(rows[0]?.value ?? 0);
+  }
+}
+
+function isTransactionPooler(connectionString: string): boolean {
+  try {
+    return new URL(connectionString).port === "6543";
+  } catch {
+    return false;
   }
 }
 

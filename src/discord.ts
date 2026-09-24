@@ -247,7 +247,7 @@ async function handleCommand(message: Message, store: Store) {
       return;
     }
     const dailyLimit = store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT);
-    await message.reply(`Состояние: **${(await store.isPaused()) ? "пауза" : "активно"}**\nЗапросов к моделям сегодня: **${await store.getRequestsToday()} / ${dailyLimit}**`);
+    await message.reply(`Состояние: **${(await store.isPaused()) ? "пауза" : "активно"}**\nЗапросов к моделям сегодня: **${await store.getRequestsToday()} / ${dailyLimit}**\nClaude Code: **${config.claudeCodeConfigured ? "подключён" : "не настроен"}**`);
     return;
   }
   if (command === "tasks" || command === "задачи") {
@@ -262,6 +262,12 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "router") {
     await message.reply(`ARGUS Decision Engine: **${config.ROUTER_ENABLED ? "включён" : "выключен"}**\nПорядок моделей:\n${config.routerModels.map((model, index) => `${index + 1}. **${model}**`).join("\n")}\nОчевидные запросы обрабатываются локальными правилами без расхода API.`);
+    return;
+  }
+  if (command === "claude") {
+    await message.reply(config.claudeCodeConfigured
+      ? "Claude Code через подписку подключён. Чтобы назначить его агенту, укажи в панели настроек модель `claude-code/sonnet` или `claude-code/opus`."
+      : "Claude Code не подключён: добавь секрет `CLAUDE_CODE_OAUTH_TOKEN`, созданный командой `claude setup-token`.");
     return;
   }
   if (command === "context" || command === "session") {
@@ -350,7 +356,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "help") {
     await message.reply(
-      "Команды: `!discuss <тема>`, `!tasks`, `!router`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!purge [1-100]`, `!clearall [1-100]`, `!pause`, `!resume`."
+      "Команды: `!discuss <тема>`, `!tasks`, `!router`, `!claude`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!purge [1-100]`, `!clearall [1-100]`, `!pause`, `!resume`."
     );
     return;
   }
@@ -957,7 +963,7 @@ async function buildSettingsPanel(store: Store) {
         .setTitle("⚙️ Настройки ARGUS")
         .setDescription("Выбери агента, чтобы изменить его модель или контекст. Кнопка «Общие лимиты» меняет ограничения сразу для всего сервера.")
         .addFields({
-          name: "Дневной лимит OpenRouter",
+          name: "Дневной лимит моделей",
           value: `Использовано **${requestsToday} / ${dailyLimit}** запросов. Счётчик сбрасывается в 00:00 UTC. Один вызов одного агента считается одним запросом; внутренние повторы при временной ошибке отдельно не считаются.`
         })
         .setColor(0x5865f2)
@@ -1230,11 +1236,11 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
   if (interaction.isButton() && action === "model" && agent) {
     const input = new TextInputBuilder()
       .setCustomId("model")
-      .setLabel("Идентификатор модели OpenRouter")
+      .setLabel("Модель OpenRouter или Claude Code")
       .setStyle(TextInputStyle.Short)
       .setRequired(true)
       .setValue(runtimeAgent(store, agent).model)
-      .setPlaceholder("deepseek/deepseek-v4-flash-0731");
+      .setPlaceholder("claude-code/sonnet");
     await interaction.showModal(
       new ModalBuilder()
         .setCustomId(`settings:model_submit:${agent.id}`)
@@ -1305,7 +1311,7 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
 
   if (interaction.isModalSubmit() && action === "model_submit" && agent) {
     const model = interaction.fields.getTextInputValue("model").trim();
-    if (!model.includes("/") || model.length > 150) throw new Error("укажи полный ID модели OpenRouter в формате provider/model");
+    if (!model.includes("/") || model.length > 150) throw new Error("укажи ID в формате provider/model или claude-code/sonnet");
     await store.setSetting(`agent_model:${agent.id}`, model);
     await interaction.reply({ content: `Модель агента **${agent.name}** изменена на \`${model}\`.`, flags: MessageFlags.Ephemeral });
     return;
@@ -1396,7 +1402,7 @@ async function formatChannelStatus(store: Store, channelId: string, agent: Agent
     `Лимит контекста: **${store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES)}**`,
     `Запросов в сессии: **${stats.session.requests}**`,
     `Токены сессии: **${stats.session.totalTokens.toLocaleString("ru-RU")}** (вход ${stats.session.promptTokens.toLocaleString("ru-RU")}, выход ${stats.session.completionTokens.toLocaleString("ru-RU")})`,
-    `Стоимость сессии по данным OpenRouter: **$${stats.session.costUsd.toFixed(6)}**`,
+    `Стоимость сессии по данным провайдера: **$${stats.session.costUsd.toFixed(6)}**`,
     `За всё время канала: **${stats.allTime.requests}** запросов, **${stats.allTime.totalTokens.toLocaleString("ru-RU")}** токенов, **$${stats.allTime.costUsd.toFixed(6)}**`
   ].join("\n");
 }

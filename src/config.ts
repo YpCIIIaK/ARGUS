@@ -17,7 +17,9 @@ const timeZone = z.string().default("Asia/Qyzylorda").refine((value) => {
 
 const schema = z.object({
   DISCORD_TOKEN: z.string().min(1),
-  OPENROUTER_API_KEY: z.string().min(1),
+  OPENROUTER_API_KEY: z.string().default(""),
+  CLAUDE_CODE_OAUTH_TOKEN: z.string().optional(),
+  CLAUDE_CODE_TIMEOUT_MS: z.coerce.number().int().min(30_000).max(900_000).default(300_000),
   DATABASE_URL: z.string().optional(),
   PORT: z.coerce.number().int().positive().default(10000),
   TIME_ZONE: timeZone,
@@ -87,6 +89,7 @@ export const config = {
   allowedChannelIds: new Set(env.ALLOWED_CHANNEL_IDS.split(",").map((v) => v.trim()).filter(Boolean)),
   ownerIds: new Set(env.OWNER_IDS.split(",").map((v) => v.trim()).filter(Boolean)),
   githubConfigured,
+  claudeCodeConfigured: Boolean(env.CLAUDE_CODE_OAUTH_TOKEN),
   routerModels: env.ROUTER_MODELS.split(",").map((value) => value.trim()).filter(Boolean),
   agentChannelIds: {
     programmer: env.PROGRAMMER_CHANNEL_ID,
