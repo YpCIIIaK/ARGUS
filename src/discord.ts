@@ -27,16 +27,19 @@ import {
   createGithubConnectUrl,
   disconnectGithub,
   githubConnectionStatus,
+  formatGithubChecks,
   githubInstallUrl,
   githubIsConfigured,
   listGithubRepositories,
   prepareGithubFileChanges,
   previewGithubFileChanges,
   readSelectedGithubFiles,
+  readGithubPullRequestContext,
   selectGithubRepository,
   selectedGithubRepository
 } from "./github.js";
 import { askAgent } from "./openrouter.js";
+import { runSandboxSmokeTest, sandboxIsConfigured, sandboxStatus } from "./sandbox.js";
 import { Store } from "./store.js";
 import { executeWebActions, webToolsConfigured } from "./web-tools.js";
 
@@ -164,6 +167,49 @@ async function handleCommand(message: Message, store: Store) {
     await handleGithubCommand(message, store, rest);
     return;
   }
+  if (command === "sandbox") {
+    const action = rest[0]?.toLowerCase() || "status";
+    if (action === "status") {
+      try {
+        const status = await sandboxStatus();
+        await message.reply(status.configured
+          ? `CodeSandbox подключён. Сейчас запущено VM: **${status.running}**.`
+          : "CodeSandbox не настроен: добавь `CSB_API_KEY` в Render.");
+      } catch (error) {
+        await message.reply(`Не удалось проверить CodeSandbox: ${errorMessage(error)}`);
+      }
+      return;
+    }
+    if (action !== "test") {
+      await message.reply("Используй `!sandbox status` или `!sandbox test`.");
+      return;
+    }
+    if (!sandboxIsConfigured()) {
+      await message.reply("CodeSandbox не настроен: добавь `CSB_API_KEY` в Render.");
+      return;
+    }
+    if (!isController(message)) {
+      await message.reply("Запуск платной вычислительной среды доступен владельцам и администраторам сервера.");
+      return;
+    }
+    const controller = new AbortController();
+    activeRuns.set(message.channelId, controller);
+    await sendAsAgent(message.channel as TextChannel, runtimeAgent(store, agents[0]!), "Передаю небольшой проверочный файл в изолированную CodeSandbox VM и прошу выполнить его.");
+    await message.reply("🧪 **Песочница:** создаю временную приватную VM…");
+    try {
+      const result = await runSandboxSmokeTest(controller.signal);
+      await message.reply(`🧪 **Песочница → Инженер:** команда завершена за **${(result.durationMs / 1000).toFixed(1)} с**.\n\`\`\`text\n${result.output || "(вывод пуст)"}\n\`\`\``);
+      await sendAsAgent(message.channel as TextChannel, runtimeAgent(store, agents[1]!), result.output.includes("ARGUS_SANDBOX_OK")
+        ? "Проверил результат песочницы: код выполнился успешно, контрольное утверждение прошло. Временная VM остановлена."
+        : "Проверка не подтвердила ожидаемый маркер успешного выполнения. Нужен разбор вывода песочницы.");
+    } catch (error) {
+      if (controller.signal.aborted) await message.reply("🛑 Выполнение в песочнице остановлено командой `!stop`.");
+      else await message.reply(`Не удалось выполнить код в CodeSandbox: ${errorMessage(error)}`);
+    } finally {
+      if (activeRuns.get(message.channelId) === controller) activeRuns.delete(message.channelId);
+    }
+    return;
+  }
   if (command === "status") {
     if (channelAgent) {
       await message.reply(await formatChannelStatus(store, message.channelId, channelAgent));
@@ -236,7 +282,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "help") {
     await message.reply(
-      "Команды: `!discuss <тема>`, `!stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
+      "Команды: `!discuss <тема>`, `!stop`, `!sandbox status`, `!sandbox test`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
     );
     return;
   }
@@ -833,7 +879,10 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
         await interaction.editReply(privateResult);
         if (interaction.message.editable) {
           const components = result.pullRequest
-            ? [new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setLabel(`Открыть Pull Request #${result.pullRequest.number}`).setEmoji("🔎").setStyle(ButtonStyle.Link).setURL(result.pullRequest.url))]
+            ? [new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder().setLabel(`Открыть Pull Request #${result.pullRequest.number}`).setEmoji("🔎").setStyle(ButtonStyle.Link).setURL(result.pullRequest.url),
+                new ButtonBuilder().setCustomId(`github:pr_checks:${interaction.user.id}:${result.pullRequest.number}`).setLabel("Обновить проверки").setEmoji("🔄").setStyle(ButtonStyle.Secondary)
+              )]
             : [];
           const outcome = result.initializedDefault
             ? `Создан первый коммит в основной ветке: [${result.branch}](<${result.url}>)`
@@ -842,9 +891,29 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
               : `Ветка [${result.branch}](<${result.url}>) создана, но Pull Request не создан`;
           await interaction.message.edit({ content: `✅ Изменено файлов: **${result.changed}** в \`${result.repo}\`. ${outcome}.`, components });
         }
+        if (result.pullRequest && interaction.channel?.isTextBased() && !interaction.channel.isDMBased()) {
+          try {
+            await runPullRequestAgentReview(interaction.channel as TextChannel, store, interaction.user.id, result.repo, result.pullRequest.number);
+          } catch (error) {
+            console.error("Pull Request agent review failed", error);
+            await interaction.channel.send(`⚠️ Pull Request создан, но агентскую проверку запустить не удалось: ${errorMessage(error)}`);
+          }
+        }
       }
     } catch (error) {
       await interaction.editReply(`Не удалось обработать изменения: ${errorMessage(error)}`);
+    }
+    return true;
+  }
+  if (action === "pr_checks" && operationId) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      const repo = selectedGithubRepository(store, interaction.user.id);
+      if (!repo) throw new Error("Рабочий репозиторий не выбран.");
+      const context = await readGithubPullRequestContext(store, interaction.user.id, repo, Number(operationId));
+      await interaction.editReply(`**Проверки PR #${context.number}**\n${formatGithubChecks(context)}`);
+    } catch (error) {
+      await interaction.editReply(`Не удалось обновить проверки: ${errorMessage(error)}`);
     }
     return true;
   }
@@ -866,6 +935,61 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
     }
   }
   return true;
+}
+
+async function runPullRequestAgentReview(channel: TextChannel, store: Store, userId: string, repo: string, pullNumber: number) {
+  const publish = async (agent: Agent, content: string) => {
+    const sent = await sendAsAgent(channel, agent, content);
+    await store.addMessage({ channelId: channel.id, discordMessageId: sent.id, author: agent.name, content });
+  };
+  const context = await readGithubPullRequestContext(store, userId, repo, pullNumber);
+  const checks = formatGithubChecks(context);
+  const files = context.files.map((file) => [
+    `--- ${file.filename || "unknown"} · ${file.status || "changed"} (+${file.additions ?? 0}/-${file.deletions ?? 0}) ---`,
+    file.patch || "[GitHub не предоставил patch: файл может быть бинарным или diff слишком велик]"
+  ].join("\n")).join("\n\n").slice(0, 80_000);
+  const base = `Репозиторий: ${context.repo}\nPull Request: #${context.number} — ${context.title}\nОписание:\n${context.body || "Нет описания"}\n\nПроверки GitHub:\n${checks}\n\nИзменённые файлы:\n${files}`;
+  const programmer = agents.find((item) => item.id === "programmer")!;
+  await publish(runtimeAgent(store, programmer), `✅ Создал черновик [Pull Request #${context.number}](<${context.url}>). Передаю изменения Инженеру и Исследователю на проверку.`);
+  await channel.send({ content: `🔍 **Начинается публичная проверка [PR #${context.number}](<${context.url}>) агентами.**\n${checks}`, allowedMentions: { parse: [] } });
+
+  const engineer = agents.find((item) => item.id === "engineer")!;
+  const researcher = agents.find((item) => item.id === "researcher")!;
+  const coordinator = agents.find((item) => item.id === "coordinator")!;
+  const reviews: Array<{ agent: Agent; content: string }> = [];
+  for (const [reviewer, task] of [
+    [engineer, "Проверь архитектуру, корректность подхода, риски отказоустойчивости и тестируемость. Перечисли блокирующие и неблокирующие замечания."],
+    [researcher, "Проверь фактическую корректность, зависимости, совместимость версий и сомнительные утверждения. Не делай веб-поиск без необходимости; укажи, что требует дополнительной проверки."]
+  ] as Array<[Agent, string]>) {
+    await publish(runtimeAgent(store, reviewer), `📥 Получил PR #${context.number} на проверку. ${task}`);
+    const dailyLimit = store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT);
+    if (!(await store.consumeRequest(dailyLimit))) {
+      await channel.send("Достигнут дневной лимит: дальнейшая проверка PR остановлена.");
+      return;
+    }
+    const configured = runtimeAgent(store, reviewer);
+    const response = await askAgent(configured, [], `${task}\n\n${base}`, store.getNumberSetting("max_output_tokens", 30_000));
+    await store.recordUsage({ channelId: channel.id, agentId: reviewer.id, model: response.model, ...response.usage });
+    reviews.push({ agent: configured, content: response.content });
+    await publish(configured, `🔎 **Проверка PR #${context.number}:**\n${response.content}`);
+  }
+
+  await publish(runtimeAgent(store, coordinator), `📥 Получил заключения Инженера и Исследователя. Формирую общий вердикт по PR #${context.number}.`);
+  const dailyLimit = store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT);
+  if (!(await store.consumeRequest(dailyLimit))) {
+    await channel.send("Достигнут дневной лимит: Координатор не смог сформировать итог PR.");
+    return;
+  }
+  const configuredCoordinator = runtimeAgent(store, coordinator);
+  const reports = reviews.map((review) => `${review.agent.name}:\n${review.content}`).join("\n\n");
+  const response = await askAgent(
+    configuredCoordinator,
+    [],
+    `Сформируй итог проверки Pull Request. Дай один вердикт: ГОТОВ К ПРОВЕРКЕ ЧЕЛОВЕКОМ, НУЖНЫ ИСПРАВЛЕНИЯ или ОЖИДАЮТСЯ ПРОВЕРКИ. Отдельно перечисли блокирующие замечания и состояние GitHub Checks. Не утверждай, что PR смержен.\n\n${base}\n\nЗАКЛЮЧЕНИЯ АГЕНТОВ:\n${reports}`,
+    store.getNumberSetting("max_output_tokens", 30_000)
+  );
+  await store.recordUsage({ channelId: channel.id, agentId: coordinator.id, model: response.model, ...response.usage });
+  await publish(configuredCoordinator, `📋 **Итог проверки PR #${context.number}:**\n${response.content}`);
 }
 
 async function handleSettingsInteraction(interaction: Interaction, store: Store) {

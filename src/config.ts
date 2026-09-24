@@ -45,6 +45,7 @@ const schema = z.object({
   JINA_API_KEY: z.string().optional(),
   SEARXNG_URL: z.string().optional(),
   SEARXNG_TOKEN: z.string().optional(),
+  CSB_API_KEY: z.string().optional(),
   MAX_AGENT_REPLIES: z.coerce.number().int().min(1).max(10).default(5),
   MAX_CONTEXT_MESSAGES: z.coerce.number().int().min(4).max(100).default(20),
   DAILY_REQUEST_LIMIT: z.coerce.number().int().positive().default(100),

@@ -20,8 +20,21 @@ type TokenResponse = {
 type GithubUser = { id: number; login: string };
 type GithubInstallation = { id: number; account?: { login?: string }; repository_selection?: string; permissions?: { contents?: string; pull_requests?: string } };
 type GithubRepository = { id: number; full_name: string; private: boolean; html_url: string; default_branch: string };
+type GithubPullFile = { filename?: string; status?: string; additions?: number; deletions?: number; patch?: string };
+type GithubCheckRun = { name?: string; status?: string; conclusion?: string | null; details_url?: string };
 
 export type GithubRepo = GithubRepository & { installationId: number; account: string; selection: string; contentsPermission: string; pullRequestsPermission: string };
+export type GithubPullReviewContext = {
+  repo: string;
+  number: number;
+  title: string;
+  body: string;
+  url: string;
+  headSha: string;
+  files: GithubPullFile[];
+  checks: GithubCheckRun[];
+  checksError?: string;
+};
 type PendingGithubChange = { repo: string; changes: GithubFileChange[]; requestedAt: string; emptyRepository: boolean };
 class GithubApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -300,6 +313,56 @@ export async function applyGithubFileChanges(
   };
 }
 
+export async function readGithubPullRequestContext(
+  store: Store,
+  discordUserId: string,
+  repoName: string,
+  pullNumber: number
+): Promise<GithubPullReviewContext> {
+  if (selectedGithubRepository(store, discordUserId) !== repoName) throw new Error("Этот репозиторий больше не выбран как рабочий.");
+  const repositories = await listGithubRepositories(store, discordUserId);
+  if (!repositories.some((item) => item.full_name === repoName)) throw new Error("Репозиторий больше недоступен GitHub App.");
+  const connection = await requireConnection(store, discordUserId);
+  const token = await validAccessToken(store, connection);
+  const [owner, repo] = repoName.split("/");
+  if (!owner || !repo || !Number.isInteger(pullNumber) || pullNumber < 1) throw new Error("Некорректный Pull Request.");
+  const root = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const [pull, files] = await Promise.all([
+    githubRequest<{ number?: number; title?: string; body?: string | null; html_url?: string; head?: { sha?: string } }>(`${root}/pulls/${pullNumber}`, token),
+    githubRequest<GithubPullFile[]>(`${root}/pulls/${pullNumber}/files?per_page=100`, token)
+  ]);
+  if (!pull.number || !pull.html_url || !pull.head?.sha) throw new Error("GitHub вернул неполные данные Pull Request.");
+  let checks: GithubCheckRun[] = [];
+  let checksError: string | undefined;
+  try {
+    const response = await githubRequest<{ check_runs?: GithubCheckRun[] }>(`${root}/commits/${pull.head.sha}/check-runs?per_page=100`, token);
+    checks = response.check_runs ?? [];
+  } catch (error) {
+    checksError = error instanceof Error ? error.message : String(error);
+  }
+  return {
+    repo: repoName,
+    number: pull.number,
+    title: pull.title || `Pull Request #${pull.number}`,
+    body: pull.body || "",
+    url: pull.html_url,
+    headSha: pull.head.sha,
+    files: files.slice(0, 100),
+    checks,
+    ...(checksError ? { checksError } : {})
+  };
+}
+
+export function formatGithubChecks(context: GithubPullReviewContext): string {
+  if (context.checksError) return `⚠️ GitHub Checks недоступны: ${context.checksError}`;
+  if (!context.checks.length) return "⏳ GitHub Checks пока не появились или workflow в репозитории не настроен.";
+  return context.checks.map((check) => {
+    const result = check.conclusion || check.status || "unknown";
+    const icon = result === "success" ? "✅" : ["failure", "cancelled", "timed_out", "action_required"].includes(result) ? "❌" : "⏳";
+    return `${icon} **${check.name || "Проверка"}** — \`${result}\`${check.details_url ? ` · [открыть](<${check.details_url}>)` : ""}`;
+  }).join("\n");
+}
+
 export async function disconnectGithub(store: Store, discordUserId: string): Promise<{ login: string; revoked: boolean }> {
   ensureConfigured();
   const connection = await requireConnection(store, discordUserId);
@@ -383,6 +446,9 @@ async function githubApiRequest<T = unknown>(path: string, token: string, init: 
   if (!response.ok) {
     const acceptedPermissions = response.headers.get("x-accepted-github-permissions") || "";
     if (response.status === 403 && /resource not accessible by integration/iu.test(data.message || "")) {
+      if (/checks=read/iu.test(acceptedPermissions)) {
+        throw new GithubApiError("GitHub App не хватает права Checks: Read-only. Добавь его в настройках приложения и подтверди обновлённые права установки.", response.status);
+      }
       throw new GithubApiError(
         `GitHub запретил запись приложению. Проверь Contents: Read and write, подтверди обновлённые права установленной GitHub App и заново выполни подключение.${acceptedPermissions ? ` Требуемые права: ${acceptedPermissions}.` : ""}`,
         response.status

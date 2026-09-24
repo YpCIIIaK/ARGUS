@@ -43,6 +43,9 @@ test("approved GitHub changes create a branch and draft pull request", async () 
     if (url.endsWith("/git/refs") && method === "POST") return json({ ref: body?.ref }, 201);
     if (url.endsWith("/contents/README.md") && method === "PUT") return json({ content: { sha: "new-file-sha" } }, 201);
     if (url.endsWith("/pulls") && method === "POST") return json({ number: 12, html_url: "https://github.com/octocat/demo/pull/12", title: body?.title }, 201);
+    if (url.endsWith("/pulls/12") && method === "GET") return json({ number: 12, html_url: "https://github.com/octocat/demo/pull/12", title: "Update README", body: "Test PR", head: { sha: "head-sha" } });
+    if (url.endsWith("/pulls/12/files?per_page=100")) return json([{ filename: "README.md", status: "modified", additions: 1, deletions: 1, patch: "@@ -1 +1 @@" }]);
+    if (url.endsWith("/commits/head-sha/check-runs?per_page=100")) return json({ check_runs: [{ name: "tests", status: "completed", conclusion: "success" }] });
     return json({ message: `Unhandled test request: ${method} ${url}` }, 500);
   };
 
@@ -57,6 +60,25 @@ test("approved GitHub changes create a branch and draft pull request", async () 
     assert.equal(pullRequest?.body?.draft, true);
     assert.equal(pullRequest?.body?.base, "main");
     assert.equal(pullRequest?.body?.head, applied.branch);
+    const reviewContext = await github.readGithubPullRequestContext(store, userId, "octocat/demo", 12);
+    assert.equal(reviewContext.headSha, "head-sha");
+    assert.equal(reviewContext.files[0]?.filename, "README.md");
+    assert.equal(reviewContext.checks[0]?.conclusion, "success");
+    const formatted = github.formatGithubChecks({
+      repo: "octocat/demo",
+      number: 12,
+      title: "Test",
+      body: "",
+      url: "https://github.com/octocat/demo/pull/12",
+      headSha: "head-sha",
+      files: [],
+      checks: [
+        { name: "tests", status: "completed", conclusion: "success", details_url: "https://github.com/check/1" },
+        { name: "lint", status: "in_progress", conclusion: null }
+      ]
+    });
+    assert.match(formatted, /✅ \*\*tests\*\*/);
+    assert.match(formatted, /⏳ \*\*lint\*\*/);
   } finally {
     globalThis.fetch = originalFetch;
   }
