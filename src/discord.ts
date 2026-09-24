@@ -310,67 +310,19 @@ async function handleGithubCommand(message: Message, store: Store, args: string[
     await message.reply("Интеграция GitHub ещё не настроена на Render.");
     return;
   }
-  const action = args[0]?.toLowerCase() || "status";
-  if (action === "connect" || action === "подключить") {
-    const current = await githubConnectionStatus(store, message.author.id);
-    const url = await createGithubConnectUrl(store, message.author.id);
-    const delivered = await sendGithubPrivateMessage(message, {
-      content: `${current ? `Сейчас подключён GitHub **@${current.githubLogin}**. Новая авторизация заменит эту привязку.\n` : ""}Открой персональную ссылку в течение 10 минут:\n${url}\n\nARGUS запомнит связь с Discord-пользователем **${message.author.username}**. Не пересылай эту одноразовую ссылку другим.`,
-      allowedMentions: { parse: [] }
-    });
-    if (delivered) await message.reply("Персональная ссылка подключения GitHub отправлена тебе в личные сообщения.");
-    return;
-  }
-  if (action === "repos" || action === "repositories" || action === "репозитории") {
-    try {
-      const repositories = await listGithubRepositories(store, message.author.id);
-      if (!repositories.length) {
-        const install = githubInstallUrl();
-        const delivered = await sendGithubPrivateMessage(message, { content: `GitHub подключён, но ARGUS не видит установок или разрешённых репозиториев.${install ? `\nУстановить приложение и выбрать репозитории: ${install}` : ""}` });
-        if (delivered) await message.reply("Результат проверки GitHub отправлен тебе в личные сообщения.");
-        return;
-      }
-      const shown = repositories.slice(0, 20);
-      const lines = shown.map((repo) => `${repo.private ? "🔒" : "🌐"} [${repo.full_name}](<${repo.html_url}>) · ветка \`${repo.default_branch}\``);
-      if (repositories.length > shown.length) lines.push(`…и ещё ${repositories.length - shown.length}.`);
-      const delivered = await sendGithubPrivateMessage(message, { content: `Репозитории, разрешённые GitHub App:\n${lines.join("\n")}`, allowedMentions: { parse: [] } });
-      if (delivered) await message.reply("Список разрешённых репозиториев отправлен тебе в личные сообщения.");
-    } catch (error) {
-      await message.reply(`Не удалось получить репозитории: ${errorMessage(error)}`);
-    }
-    return;
-  }
-  if (action === "disconnect" || action === "отвязать") {
-    const current = await githubConnectionStatus(store, message.author.id);
-    if (!current) {
-      await message.reply("GitHub не подключён.");
-      return;
-    }
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`github:disconnect:${message.author.id}`).setLabel(`Отвязать @${current.githubLogin}`).setStyle(ButtonStyle.Danger)
-    );
-    const delivered = await sendGithubPrivateMessage(message, { content: "ARGUS удалит сохранённые токены и попытается отозвать авторизацию на GitHub. Установка GitHub App в выбранных репозиториях останется, пока ты отдельно не удалишь её в GitHub.", components: [row] });
-    if (delivered) await message.reply("Подтверждение отвязки GitHub отправлено тебе в личные сообщения.");
-    return;
-  }
-  const current = await githubConnectionStatus(store, message.author.id);
-  if (!current) {
-    await message.reply("GitHub не подключён. Используй `!github connect`.");
-    return;
-  }
-  const delivered = await sendGithubPrivateMessage(message, { content: `Подключён GitHub **@${current.githubLogin}**.\nКоманды: \`!github repos\`, \`!github disconnect\`.` });
-  if (delivered) await message.reply("Статус GitHub отправлен тебе в личные сообщения.");
-}
-
-async function sendGithubPrivateMessage(message: Message, payload: Parameters<Message["author"]["send"]>[0]): Promise<boolean> {
-  try {
-    await message.author.send(payload);
-    return true;
-  } catch (error) {
-    console.warn(`Cannot send GitHub details to Discord user ${message.author.id}`, error);
-    await message.reply("Не удалось отправить личное сообщение. Разреши Direct Messages from server members и повтори команду.");
-    return false;
-  }
+  const requested = args[0]?.toLowerCase();
+  const hint = requested ? ` Нажми соответствующую кнопку для команды \`${message.content.trim()}\`.` : "";
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`github:connect:${message.author.id}`).setLabel("Подключить").setEmoji("🔗").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`github:status:${message.author.id}`).setLabel("Статус").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`github:repos:${message.author.id}`).setLabel("Репозитории").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`github:disconnect:${message.author.id}`).setLabel("Отвязать").setStyle(ButtonStyle.Danger)
+  );
+  await message.reply({
+    content: `**GitHub · ${message.author.username}**${hint}\nРезультат нажатия увидишь только ты прямо в этом канале.`,
+    components: [row],
+    allowedMentions: { parse: [] }
+  });
 }
 
 function isController(message: Message) {
@@ -721,15 +673,52 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
     await interaction.reply({ content: "Эта кнопка относится к GitHub-подключению другого пользователя.", ephemeral: true });
     return true;
   }
+  if (action === "connect") {
+    await interaction.deferReply({ ephemeral: true });
+    const current = await githubConnectionStatus(store, interaction.user.id);
+    const url = await createGithubConnectUrl(store, interaction.user.id);
+    await interaction.editReply(`${current ? `Сейчас подключён GitHub **@${current.githubLogin}**. Новая авторизация заменит привязку.\n` : ""}Персональная ссылка действует 10 минут:\n${url}\n\nНе пересылай её другим пользователям.`);
+    return true;
+  }
+  if (action === "status") {
+    const current = await githubConnectionStatus(store, interaction.user.id);
+    await interaction.reply({
+      content: current ? `Подключён GitHub **@${current.githubLogin}**.` : "GitHub не подключён. Нажми «Подключить».",
+      ephemeral: true
+    });
+    return true;
+  }
+  if (action === "repos") {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const repositories = await listGithubRepositories(store, interaction.user.id);
+      if (!repositories.length) {
+        const install = githubInstallUrl();
+        await interaction.editReply(`ARGUS не видит установок или разрешённых репозиториев.${install ? `\nУстановить приложение и выбрать репозитории: ${install}` : ""}`);
+        return true;
+      }
+      const shown = repositories.slice(0, 15);
+      const lines = shown.map((repo) => `${repo.private ? "🔒" : "🌐"} [${repo.full_name}](<${repo.html_url}>) · \`${repo.default_branch}\``);
+      if (repositories.length > shown.length) lines.push(`…и ещё ${repositories.length - shown.length}.`);
+      await interaction.editReply(`Репозитории, разрешённые GitHub App:\n${lines.join("\n")}`);
+    } catch (error) {
+      await interaction.editReply(`Не удалось получить репозитории: ${errorMessage(error)}`);
+    }
+    return true;
+  }
   if (action === "disconnect") {
     await interaction.deferReply({ ephemeral: true });
     try {
+      const current = await githubConnectionStatus(store, interaction.user.id);
+      if (!current) {
+        await interaction.editReply("GitHub не подключён.");
+        return true;
+      }
       const result = await disconnectGithub(store, interaction.user.id);
       const remote = result.revoked
         ? "Авторизация также отозвана на GitHub."
         : "Локальные токены удалены, но GitHub не подтвердил удалённый отзыв. Проверь Authorized GitHub Apps в настройках GitHub.";
       await interaction.editReply(`GitHub **@${result.login}** отвязан от Discord-пользователя. ${remote}`);
-      if (interaction.message.editable) await interaction.message.edit({ components: [] }).catch(() => undefined);
     } catch (error) {
       await interaction.editReply(`Не удалось отвязать GitHub: ${errorMessage(error)}`);
     }
