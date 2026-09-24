@@ -4,6 +4,7 @@ const agentIds = new Set<AgentId>(["programmer", "engineer", "creative", "resear
 
 export type GeneratedFile = { name: string; content: string };
 export type GithubFileChange = { action: "write" | "delete"; path: string; content?: string };
+export type WebAction = { type: "search"; query: string } | { type: "read"; url: string };
 
 export function parseAgentActions(content: string, agent: Agent): {
   content: string;
@@ -11,11 +12,13 @@ export function parseAgentActions(content: string, agent: Agent): {
   delegations: Array<{ agentId: AgentId; task: string }>;
   githubChanges: GithubFileChange[];
   githubReads: string[];
+  webActions: WebAction[];
 } {
   const files: GeneratedFile[] = [];
   const delegations: Array<{ agentId: AgentId; task: string }> = [];
   const githubChanges: GithubFileChange[] = [];
   const githubReads: string[] = [];
+  const webActions: WebAction[] = [];
   let visible = content;
 
   visible = visible.replace(
@@ -61,7 +64,41 @@ export function parseAgentActions(content: string, agent: Agent): {
       return "";
     }
   );
-  return { content: visible.trim(), files, delegations, githubChanges, githubReads };
+  visible = visible.replace(
+    /\[WEB_SEARCH\s+query=["']([^"'\r\n]+)["']\s*\](?:\s*\[\/WEB_SEARCH\])?/giu,
+    (_match, rawQuery: string) => {
+      const query = rawQuery.trim().slice(0, 500);
+      if (agent.capabilities.includes("web_search") && query && webActions.filter((item) => item.type === "search").length < 3) {
+        webActions.push({ type: "search", query });
+      }
+      return "";
+    }
+  );
+  visible = visible.replace(
+    /\[WEB_READ\s+url=["']([^"'\r\n]+)["']\s*\](?:\s*\[\/WEB_READ\])?/giu,
+    (_match, rawUrl: string) => {
+      const url = safePublicUrl(rawUrl);
+      if (agent.capabilities.includes("web_read") && url && webActions.filter((item) => item.type === "read").length < 5) {
+        webActions.push({ type: "read", url });
+      }
+      return "";
+    }
+  );
+  return { content: visible.trim(), files, delegations, githubChanges, githubReads, webActions };
+}
+
+export function safePublicUrl(raw: string): string | null {
+  try {
+    const url = new URL(raw.trim());
+    if (!(["http:", "https:"] as string[]).includes(url.protocol) || url.username || url.password) return null;
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) return null;
+    if (/^(127\.|10\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) return null;
+    if (host === "::1" || host === "::" || host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
 }
 
 function safeFileName(raw: string): string | null {

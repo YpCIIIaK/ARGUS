@@ -38,6 +38,7 @@ import {
 } from "./github.js";
 import { askAgent } from "./openrouter.js";
 import { Store } from "./store.js";
+import { executeWebActions, webToolsConfigured } from "./web-tools.js";
 
 const commandPrefix = "!";
 const webhookCache = new Map<string, WebhookClient>();
@@ -438,6 +439,21 @@ async function executeAgentWorkflow(input: {
   await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
 
   let parsed = parseAgentActions(result.content, agent);
+  if (parsed.webActions.length && !signal.aborted) {
+    state.progress.push(`🌐 ${agent.emoji} ${agent.name}: выполняет ${parsed.webActions.length} веб-запрос(а)`);
+    await updateProgress();
+    const webContext = await executeWebActions(parsed.webActions, signal);
+    if (!(await store.consumeRequest(dailyLimit))) throw new DailyLimitError();
+    result = await askAgent(
+      configuredAgent,
+      context,
+      `${workflowRequest(configuredAgent, task, originalRequest, depth, githubRepo)}\n\nРЕЗУЛЬТАТЫ ВЕБ-ИНСТРУМЕНТОВ:\n${webContext}\n\nТеперь дай проверенный ответ по задаче. Укажи прямые ссылки на источники, которыми воспользовался. Повторно вызывать веб-инструменты в этом запуске нельзя.`,
+      store.getNumberSetting("max_output_tokens", 30_000),
+      signal
+    );
+    await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
+    parsed = parseAgentActions(result.content, { ...agent, capabilities: agent.capabilities.filter((capability) => capability !== "web_search" && capability !== "web_read") });
+  }
   if (parsed.githubReads.length && githubRepo && !signal.aborted) {
     state.progress.push(`📖 ${agent.emoji} ${agent.name}: читает ${parsed.githubReads.length} файл(а) из GitHub`);
     await updateProgress();
@@ -567,7 +583,12 @@ function workflowRequest(agent: Agent, task: string, originalRequest: string, de
     : agent.capabilities.includes("github_files")
       ? "\nGitHub подключаемый инструмент доступен, но рабочий репозиторий не выбран. Попроси пользователя открыть `!github` → «Репозитории» и выбрать его."
       : "";
-  return `ИСХОДНАЯ ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${originalRequest}\n\nТВОЯ ТЕКУЩАЯ ПОДЗАДАЧА (уровень ${depth}):\n${task}\n\nТвои возможности: ${own}.\nКоманда: ${roster}.\nЕсли для выполнения действительно нужна возможность другого агента, передай ему одну конкретную подзадачу точным блоком:\n[DELEGATE agent="programmer"]\nчто именно требуется сделать и какие данные использовать\n[/DELEGATE]\nМожно заменить programmer на engineer, creative, researcher или coordinator. Не делегируй то, что способен сделать сам. Не вызывай самого себя. Не утверждай, что помощник уже выполнил задачу.${createFileProtocol}${githubProtocol}`;
+  const webProtocol = agent.capabilities.includes("web_search") && webToolsConfigured()
+    ? `\nТы можешь искать актуальные сведения в интернете блоком [WEB_SEARCH query="точный поисковый запрос"][/WEB_SEARCH] и читать конкретную публичную страницу блоком [WEB_READ url="https://example.com/page"][/WEB_READ]. Сначала запроси нужные источники, после чего получишь их содержимое отдельным шагом. За один запуск доступно до трёх поисков и пяти страниц. Не выдумывай результаты и в итоговом ответе укажи прямые ссылки.`
+    : agent.capabilities.includes("web_search")
+      ? "\nВеб-инструмент пока не настроен: владельцу нужно добавить JINA_API_KEY в Render."
+      : "";
+  return `ИСХОДНАЯ ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${originalRequest}\n\nТВОЯ ТЕКУЩАЯ ПОДЗАДАЧА (уровень ${depth}):\n${task}\n\nТвои возможности: ${own}.\nКоманда: ${roster}.\nЕсли для выполнения действительно нужна возможность другого агента, передай ему одну конкретную подзадачу точным блоком:\n[DELEGATE agent="programmer"]\nчто именно требуется сделать и какие данные использовать\n[/DELEGATE]\nМожно заменить programmer на engineer, creative, researcher или coordinator. Не делегируй то, что способен сделать сам. Не вызывай самого себя. Не утверждай, что помощник уже выполнил задачу.${createFileProtocol}${githubProtocol}${webProtocol}`;
 }
 
 async function sendGithubApproval(
@@ -670,6 +691,8 @@ function capabilityLabel(capability: Agent["capabilities"][number]): string {
     create_file: "создание файлов",
     write_code: "написание кода",
     github_files: "файлы GitHub через подтверждение",
+    web_search: "поиск в интернете",
+    web_read: "чтение веб-страниц",
     architecture: "архитектура",
     creative_content: "креативный контент",
     research: "исследование",

@@ -13,6 +13,8 @@ services:
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false
+      - key: JINA_API_KEY
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: BOUNTY_CHANNEL_ID

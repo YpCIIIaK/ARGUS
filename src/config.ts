@@ -32,6 +32,7 @@ const schema = z.object({
   GITHUB_APP_SLUG: z.string().optional(),
   GITHUB_CALLBACK_URL: z.preprocess((value) => value === "" ? undefined : value, z.string().url().optional()),
   GITHUB_TOKEN_ENCRYPTION_KEY: z.string().optional(),
+  JINA_API_KEY: z.string().optional(),
   MAX_AGENT_REPLIES: z.coerce.number().int().min(1).max(10).default(5),
   MAX_CONTEXT_MESSAGES: z.coerce.number().int().min(4).max(100).default(20),
   DAILY_REQUEST_LIMIT: z.coerce.number().int().positive().default(100),

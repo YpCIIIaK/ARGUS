@@ -1,7 +1,7 @@
 import { config } from "./config.js";
 
 export type AgentId = "programmer" | "engineer" | "creative" | "researcher" | "coordinator";
-export type AgentCapability = "create_file" | "write_code" | "github_files" | "architecture" | "creative_content" | "research" | "coordination";
+export type AgentCapability = "create_file" | "write_code" | "github_files" | "web_search" | "web_read" | "architecture" | "creative_content" | "research" | "coordination";
 
 export type Agent = {
   id: AgentId;
@@ -59,8 +59,8 @@ export const agents: Agent[] = [
     color: 0x10b981,
     model: config.RESEARCHER_MODEL || config.DEFAULT_MODEL,
     keywords: ["исслед", "проверь", "факт", "сравни", "найди", "анализ", "источник"],
-    capabilities: ["research"],
-    prompt: `${common}\nТы Исследователь. Отделяй известные факты от предположений, задавай уточняющие вопросы и предлагай, что нужно проверить. Интернет-поиска у тебя пока нет.`
+    capabilities: ["research", "web_search", "web_read"],
+    prompt: `${common}\nТы Исследователь. Отделяй известные факты от предположений, проверяй актуальные сведения через веб-инструменты и указывай ссылки на использованные источники.`
   },
   {
     id: "coordinator",

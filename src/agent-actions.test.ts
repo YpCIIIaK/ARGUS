@@ -62,3 +62,24 @@ test("programmer can request safe GitHub files before editing", () => {
   const parsed = parseAgentActions('[GITHUB_READ path="src/index.ts"][/GITHUB_READ]\n[GITHUB_READ path="../.env"][/GITHUB_READ]', programmer);
   assert.deepEqual(parsed.githubReads, ["src/index.ts"]);
 });
+
+test("researcher can request web search and public pages", () => {
+  const researcher = mockAgent("researcher", ["research", "web_search", "web_read"]);
+  const parsed = parseAgentActions(
+    '[WEB_SEARCH query="Node.js 22 documentation"][/WEB_SEARCH]\n[WEB_READ url="https://nodejs.org/docs/latest/api/"][/WEB_READ]',
+    researcher
+  );
+  assert.deepEqual(parsed.webActions, [
+    { type: "search", query: "Node.js 22 documentation" },
+    { type: "read", url: "https://nodejs.org/docs/latest/api/" }
+  ]);
+});
+
+test("web reader rejects local, private and credential-bearing URLs", () => {
+  const researcher = mockAgent("researcher", ["web_read"]);
+  const parsed = parseAgentActions(
+    '[WEB_READ url="http://127.0.0.1:3000/secret"][/WEB_READ]\n[WEB_READ url="http://169.254.169.254/latest/meta-data"][/WEB_READ]\n[WEB_READ url="https://user:pass@example.com/private"][/WEB_READ]',
+    researcher
+  );
+  assert.deepEqual(parsed.webActions, []);
+});
