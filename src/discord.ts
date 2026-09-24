@@ -266,7 +266,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "claude") {
     await message.reply(config.claudeCodeConfigured
-      ? "Claude Code через подписку подключён. Доступны `claude-code/sonnet`, `claude-code/opus` и точная модель `claude-code/claude-opus-5-5`. Модель и effort меняются через `!settings`."
+      ? "Claude Code настроен через **подписочный OAuth-токен**. `ANTHROPIC_API_KEY` и `ANTHROPIC_AUTH_TOKEN` удаляются перед каждым запуском. Доступны `claude-code/sonnet`, `claude-code/opus` и точная модель `claude-code/claude-opus-5-5`. После первого ответа `!status` покажет фактический model ID, возвращённый Claude Code."
       : "Claude Code не подключён: добавь секрет `CLAUDE_CODE_OAUTH_TOKEN`, созданный командой `claude setup-token`.");
     return;
   }

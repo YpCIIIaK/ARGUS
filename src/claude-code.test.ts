@@ -21,9 +21,10 @@ test("parses Claude Code JSON usage", () => {
     is_error: false,
     result: "Готово",
     total_cost_usd: 0,
-    usage: { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 3 }
+    usage: { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 3 },
+    modelUsage: { "claude-opus-5-5": { inputTokens: 10, outputTokens: 3 } }
   }), "sonnet");
   assert.equal(result.content, "Готово");
-  assert.equal(result.model, "claude-code/sonnet");
+  assert.equal(result.model, "claude-code/claude-opus-5-5");
   assert.deepEqual(result.usage, { promptTokens: 14, completionTokens: 3, totalTokens: 17, costUsd: 0 });
 });

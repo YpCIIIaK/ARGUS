@@ -16,6 +16,13 @@ type ClaudeJsonResult = {
     cache_read_input_tokens?: number;
     output_tokens?: number;
   };
+  modelUsage?: Record<string, {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
+    costUSD?: number;
+  }>;
 };
 
 export function isClaudeCodeModel(model: string): boolean {
@@ -45,9 +52,11 @@ export function parseClaudeCodeResult(stdout: string, requestedModel: string): A
     + (data.usage?.cache_creation_input_tokens ?? 0)
     + (data.usage?.cache_read_input_tokens ?? 0);
   const completionTokens = data.usage?.output_tokens ?? 0;
+  const actualModels = Object.keys(data.modelUsage ?? {});
+  const actualModel = actualModels.length === 1 ? actualModels[0]! : actualModels.length > 1 ? actualModels.join("+") : requestedModel;
   return {
     content,
-    model: `claude-code/${requestedModel}`,
+    model: `claude-code/${actualModel}`,
     usage: {
       promptTokens,
       completionTokens,
