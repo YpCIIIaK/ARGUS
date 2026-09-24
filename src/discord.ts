@@ -5,6 +5,7 @@ import {
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  MessageFlags,
   ModalBuilder,
   PermissionsBitField,
   StringSelectMenuBuilder,
@@ -96,8 +97,8 @@ export function createDiscordClient(store: Store) {
       console.error("Settings interaction failed", error);
       const content = `Не удалось применить настройку: ${errorMessage(error)}`;
       if (interaction.isRepliable()) {
-        if (interaction.replied || interaction.deferred) await interaction.followUp({ content, ephemeral: true }).catch(() => undefined);
-        else await interaction.reply({ content, ephemeral: true }).catch(() => undefined);
+        if (interaction.replied || interaction.deferred) await interaction.followUp({ content, flags: MessageFlags.Ephemeral }).catch(() => undefined);
+        else await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => undefined);
       }
     });
   });
@@ -572,16 +573,16 @@ function workflowRequest(agent: Agent, task: string, originalRequest: string, de
 async function sendGithubApproval(
   message: Message,
   agent: Agent,
-  pending: { id: string; repo: string; expiresAt: Date },
+  pending: { id: string; repo: string; expiresAt: Date; emptyRepository: boolean },
   changes: Array<{ action: "write" | "delete"; path: string }>
 ) {
   const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`github:review:${message.author.id}:${pending.id}`).setLabel("Просмотреть").setEmoji("👁️").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`github:apply:${message.author.id}:${pending.id}`).setLabel("Применить в новой ветке").setEmoji("✅").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`github:apply:${message.author.id}:${pending.id}`).setLabel(pending.emptyRepository ? "Создать первый коммит" : "Применить в новой ветке").setEmoji("✅").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`github:cancel:${message.author.id}:${pending.id}`).setLabel("Отменить").setStyle(ButtonStyle.Danger)
   );
   await message.reply({
-    content: `${agent.emoji} **${agent.name} подготовил ${changes.length} изменение(я) GitHub.**\nНазвания приватного репозитория и файлов доступны владельцу через кнопку «Просмотреть». После подтверждения ARGUS создаст отдельную ветку. Пакет действует 15 минут.`,
+    content: `${agent.emoji} **${agent.name} подготовил ${changes.length} изменение(я) GitHub.**\nНазвания приватного репозитория и файлов доступны владельцу через кнопку «Просмотреть». ${pending.emptyRepository ? "Репозиторий пуст: подтверждение создаст первый коммит и основную ветку — отдельную ветку до первого коммита GitHub создать не позволяет." : "После подтверждения ARGUS создаст отдельную ветку."} Пакет действует 15 минут.`,
     components: [buttons],
     allowedMentions: { parse: [] }
   });
@@ -726,11 +727,11 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
   if ((!interaction.isButton() && !interaction.isStringSelectMenu()) || !interaction.customId.startsWith("github:")) return false;
   const [, action, ownerId, operationId] = interaction.customId.split(":");
   if (ownerId !== interaction.user.id) {
-    await interaction.reply({ content: "Эта кнопка относится к GitHub-подключению другого пользователя.", ephemeral: true });
+    await interaction.reply({ content: "Эта кнопка относится к GitHub-подключению другого пользователя.", flags: MessageFlags.Ephemeral });
     return true;
   }
   if (action === "connect") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const current = await githubConnectionStatus(store, interaction.user.id);
     const url = await createGithubConnectUrl(store, interaction.user.id);
     await interaction.editReply(`${current ? `Сейчас подключён GitHub **@${current.githubLogin}**. Новая авторизация заменит привязку.\n` : ""}Персональная ссылка действует 10 минут:\n${url}\n\nНе пересылай её другим пользователям.`);
@@ -741,12 +742,12 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
     const selected = selectedGithubRepository(store, interaction.user.id);
     await interaction.reply({
       content: current ? `Подключён GitHub **@${current.githubLogin}**.\nРабочий репозиторий: ${selected ? `\`${selected}\`` : "не выбран"}.` : "GitHub не подключён. Нажми «Подключить».",
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
     return true;
   }
   if (action === "repos") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const repositories = await listGithubRepositories(store, interaction.user.id);
       if (!repositories.length) {
@@ -772,7 +773,7 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
     return true;
   }
   if (action === "select_repo" && interaction.isStringSelectMenu()) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const repo = interaction.values[0];
       if (!repo) throw new Error("Репозиторий не выбран.");
@@ -784,7 +785,7 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
     return true;
   }
   if ((action === "review" || action === "apply" || action === "cancel") && operationId) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       if (action === "review") {
         const pending = await previewGithubFileChanges(store, interaction.user.id, operationId);
@@ -801,8 +802,10 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
         if (interaction.message.editable) await interaction.message.edit({ content: "🚫 Пакет изменений GitHub отменён пользователем.", components: [] });
       } else {
         const result = await applyGithubFileChanges(store, interaction.user.id, operationId);
-        await interaction.editReply(`Изменения применены в отдельной ветке \`${result.branch}\`.`);
-        if (interaction.message.editable) await interaction.message.edit({ content: `✅ Изменено файлов: **${result.changed}** в \`${result.repo}\`. Ветка: [${result.branch}](<${result.url}>)`, components: [] });
+        await interaction.editReply(result.initializedDefault
+          ? `Пустой репозиторий инициализирован первым коммитом в \`${result.branch}\`.`
+          : `Изменения применены в отдельной ветке \`${result.branch}\`.`);
+        if (interaction.message.editable) await interaction.message.edit({ content: `✅ Изменено файлов: **${result.changed}** в \`${result.repo}\`. ${result.initializedDefault ? "Создан первый коммит в основной ветке" : "Ветка"}: [${result.branch}](<${result.url}>)`, components: [] });
       }
     } catch (error) {
       await interaction.editReply(`Не удалось обработать изменения: ${errorMessage(error)}`);
@@ -810,7 +813,7 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
     return true;
   }
   if (action === "disconnect") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const current = await githubConnectionStatus(store, interaction.user.id);
       if (!current) {
@@ -833,14 +836,14 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
   if (!interaction.isStringSelectMenu() && !interaction.isButton() && !interaction.isModalSubmit()) return;
   if (!interaction.customId.startsWith("settings:")) return;
   if (!isInteractionController(interaction)) {
-    await interaction.reply({ content: "Настройки доступны владельцам и администраторам сервера.", ephemeral: true });
+    await interaction.reply({ content: "Настройки доступны владельцам и администраторам сервера.", flags: MessageFlags.Ephemeral });
     return;
   }
 
   if (interaction.isStringSelectMenu() && interaction.customId === "settings:agent") {
     const agent = agents.find((item) => item.id === interaction.values[0]);
     if (!agent || !interaction.guild) return;
-    await interaction.reply({ ...(await buildAgentSettings(store, interaction.guild, agent)), ephemeral: true });
+    await interaction.reply({ ...(await buildAgentSettings(store, interaction.guild, agent)), flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -855,7 +858,7 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
       const stats = await store.usageStats(channelId);
       return `${agent.emoji} **${agent.name}** — ${stats.allTime.requests} запросов · ${stats.allTime.totalTokens.toLocaleString("ru-RU")} токенов · $${stats.allTime.costUsd.toFixed(6)}`;
     }));
-    await interaction.reply({ content: lines.join("\n"), ephemeral: true });
+    await interaction.reply({ content: lines.join("\n"), flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -898,7 +901,7 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`settings:clear_confirm:${agent.id}`).setLabel("Да, очистить контекст").setStyle(ButtonStyle.Danger)
     );
-    await interaction.reply({ content: `Очистить память агента **${agent.name}** и начать новую сессию? Сообщения Discord останутся.`, components: [row], ephemeral: true });
+    await interaction.reply({ content: `Очистить память агента **${agent.name}** и начать новую сессию? Сообщения Discord останутся.`, components: [row], flags: MessageFlags.Ephemeral });
     return;
   }
   if (interaction.isButton() && action === "compact" && agent && interaction.guild) {
@@ -906,14 +909,14 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
     if (!channelId) throw new Error(`канал #${agent.channelName} не найден`);
     const context = await store.recent(channelId, 100);
     if (!context.length) {
-      await interaction.reply({ content: "Контекст пока пуст — компактировать нечего.", ephemeral: true });
+      await interaction.reply({ content: "Контекст пока пуст — компактировать нечего.", flags: MessageFlags.Ephemeral });
       return;
     }
     if (!(await store.consumeRequest(store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT)))) {
-      await interaction.reply({ content: "Достигнут дневной лимит запросов к моделям.", ephemeral: true });
+      await interaction.reply({ content: "Достигнут дневной лимит запросов к моделям.", flags: MessageFlags.Ephemeral });
       return;
     }
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const configuredAgent = runtimeAgent(store, agent);
     const result = await askAgent(
       configuredAgent,
@@ -942,13 +945,13 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
     const model = interaction.fields.getTextInputValue("model").trim();
     if (!model.includes("/") || model.length > 150) throw new Error("укажи полный ID модели OpenRouter в формате provider/model");
     await store.setSetting(`agent_model:${agent.id}`, model);
-    await interaction.reply({ content: `Модель агента **${agent.name}** изменена на \`${model}\`.`, ephemeral: true });
+    await interaction.reply({ content: `Модель агента **${agent.name}** изменена на \`${model}\`.`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (interaction.isModalSubmit() && action === "context_submit" && agent) {
     const limit = boundedNumber(interaction.fields.getTextInputValue("context_limit"), 4, 100, "лимит контекста");
     await store.setSetting(`context_limit:${agent.id}`, String(limit));
-    await interaction.reply({ content: `Контекст агента **${agent.name}**: последние **${limit}** сообщений.`, ephemeral: true });
+    await interaction.reply({ content: `Контекст агента **${agent.name}**: последние **${limit}** сообщений.`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (interaction.isModalSubmit() && action === "limits_submit") {
@@ -960,7 +963,7 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
       store.setSetting("daily_request_limit", String(dailyLimit)),
       store.setSetting("max_output_tokens", String(maxTokens))
     ]);
-    await interaction.reply({ content: `Лимиты сохранены для всего сервера:\n• агентов за один раунд — **${maxReplies}**;\n• вызовов агентов в сутки — **${dailyLimit}**;\n• максимум токенов одного ответа агента — **${maxTokens.toLocaleString("ru-RU")}**.`, ephemeral: true });
+    await interaction.reply({ content: `Лимиты сохранены для всего сервера:\n• агентов за один раунд — **${maxReplies}**;\n• вызовов агентов в сутки — **${dailyLimit}**;\n• максимум токенов одного ответа агента — **${maxTokens.toLocaleString("ru-RU")}**.`, flags: MessageFlags.Ephemeral });
   }
 }
 

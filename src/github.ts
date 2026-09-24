@@ -22,7 +22,12 @@ type GithubInstallation = { id: number; account?: { login?: string }; repository
 type GithubRepository = { id: number; full_name: string; private: boolean; html_url: string; default_branch: string };
 
 export type GithubRepo = GithubRepository & { installationId: number; account: string; selection: string };
-type PendingGithubChange = { repo: string; changes: GithubFileChange[]; requestedAt: string };
+type PendingGithubChange = { repo: string; changes: GithubFileChange[]; requestedAt: string; emptyRepository: boolean };
+class GithubApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
 
 export function githubIsConfigured(): boolean {
   return config.githubConfigured;
@@ -106,23 +111,31 @@ export async function prepareGithubFileChanges(
   store: Store,
   discordUserId: string,
   changes: GithubFileChange[]
-): Promise<{ id: string; repo: string; expiresAt: Date }> {
+): Promise<{ id: string; repo: string; expiresAt: Date; emptyRepository: boolean }> {
   if (!changes.length) throw new Error("Нет изменений для GitHub.");
   const repo = selectedGithubRepository(store, discordUserId);
   if (!repo) throw new Error("Сначала выбери репозиторий через `!github` → «Репозитории».");
   const repositories = await listGithubRepositories(store, discordUserId);
-  if (!repositories.some((repository) => repository.full_name === repo)) {
+  const repository = repositories.find((item) => item.full_name === repo);
+  if (!repository) {
     await store.deleteSetting(`github_repo:${discordUserId}`);
     throw new Error("Ранее выбранный репозиторий больше недоступен. Выбери его заново.");
   }
   if (new Set(changes.map((change) => change.path)).size !== changes.length) throw new Error("Один файл нельзя изменять несколько раз в одном пакете.");
   const totalBytes = changes.reduce((sum, change) => sum + Buffer.byteLength(change.content || "", "utf8"), 0);
   if (totalBytes > 5_000_000) throw new Error("Общий размер пакета изменений превышает 5 МБ.");
+  const connection = await requireConnection(store, discordUserId);
+  const token = await validAccessToken(store, connection);
+  const [owner, repoName] = repo.split("/");
+  if (!owner || !repoName) throw new Error("Некорректное имя репозитория.");
+  const root = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`;
+  const emptyRepository = !(await githubDefaultBranchSha(root, repository.default_branch, token));
+  if (emptyRepository && changes.some((change) => change.action === "delete")) throw new Error("В пустом репозитории пока нечего удалять.");
   const id = randomBytes(12).toString("base64url");
   const expiresAt = new Date(Date.now() + 15 * 60_000);
-  const payload: PendingGithubChange = { repo, changes: changes.slice(0, 10), requestedAt: new Date().toISOString() };
+  const payload: PendingGithubChange = { repo, changes: changes.slice(0, 10), requestedAt: new Date().toISOString(), emptyRepository };
   await store.saveGithubPendingChange(id, discordUserId, encryptToken(JSON.stringify(payload)), expiresAt);
-  return { id, repo, expiresAt };
+  return { id, repo, expiresAt, emptyRepository };
 }
 
 export async function previewGithubFileChanges(store: Store, discordUserId: string, id: string): Promise<PendingGithubChange> {
@@ -149,10 +162,16 @@ export async function readSelectedGithubFiles(
   const result: Array<{ path: string; content: string }> = [];
   let totalBytes = 0;
   for (const path of paths.slice(0, 5)) {
-    const data = await githubRequest<{ type?: string; size?: number; encoding?: string; content?: string; message?: string }>(
-      `${root}/contents/${encodeRepositoryPath(path)}?ref=${encodeURIComponent(repository.default_branch)}`,
-      token
-    );
+    let data: { type?: string; size?: number; encoding?: string; content?: string; message?: string };
+    try {
+      data = await githubRequest(`${root}/contents/${encodeRepositoryPath(path)}?ref=${encodeURIComponent(repository.default_branch)}`, token);
+    } catch (error) {
+      if (error instanceof GithubApiError && (error.status === 404 || error.status === 409)) {
+        result.push({ path, content: "[Файл отсутствует. Репозиторий может быть пустым; создай файл с новым содержимым.]" });
+        continue;
+      }
+      throw error;
+    }
     if (data.type !== "file" || data.encoding !== "base64" || typeof data.content !== "string") throw new Error(`${path} не является доступным текстовым файлом.`);
     const buffer = Buffer.from(data.content.replace(/\s/g, ""), "base64");
     totalBytes += buffer.length;
@@ -171,7 +190,7 @@ export async function applyGithubFileChanges(
   store: Store,
   discordUserId: string,
   id: string
-): Promise<{ repo: string; branch: string; url: string; changed: number }> {
+): Promise<{ repo: string; branch: string; url: string; changed: number; initializedDefault: boolean }> {
   const encrypted = await store.consumeGithubPendingChange(id, discordUserId);
   if (!encrypted) throw new Error("Пакет изменений не найден, уже обработан или просрочен.");
   const pending = JSON.parse(decryptToken(encrypted)) as PendingGithubChange;
@@ -191,9 +210,27 @@ export async function applyGithubFileChanges(
     fileStates.set(change.path, existing);
   }
 
-  const reference = await githubRequest<{ object?: { sha?: string } }>(`${root}/git/ref/heads/${encodeURIComponent(defaultBranch)}`, token);
-  const baseSha = reference.object?.sha;
-  if (!baseSha) throw new Error("GitHub не вернул SHA основной ветки.");
+  const baseSha = await githubDefaultBranchSha(root, defaultBranch, token);
+  if (!baseSha) {
+    if (pending.changes.some((change) => change.action !== "write")) throw new Error("Пустой репозиторий можно только инициализировать новыми файлами.");
+    for (const [index, change] of pending.changes.entries()) {
+      await githubApiRequest(`${root}/contents/${encodeRepositoryPath(change.path)}`, token, {
+        method: "PUT",
+        body: JSON.stringify({
+          message: `${index === 0 ? "Initialize repository with" : "Create"} ${change.path} via ARGUS`,
+          content: Buffer.from(change.content || "", "utf8").toString("base64"),
+          ...(index === 0 ? {} : { branch: defaultBranch })
+        })
+      });
+    }
+    return {
+      repo: pending.repo,
+      branch: defaultBranch,
+      url: `https://github.com/${pending.repo}/tree/${encodeURIComponent(defaultBranch)}`,
+      changed: pending.changes.length,
+      initializedDefault: true
+    };
+  }
   const branch = `argus/${new Date().toISOString().slice(0, 10)}-${id.slice(0, 6).toLowerCase()}`;
   await githubApiRequest(`${root}/git/refs`, token, {
     method: "POST",
@@ -224,7 +261,8 @@ export async function applyGithubFileChanges(
     repo: pending.repo,
     branch,
     url: `https://github.com/${pending.repo}/tree/${encodeURIComponent(branch)}`,
-    changed: pending.changes.length
+    changed: pending.changes.length,
+    initializedDefault: false
   };
 }
 
@@ -308,7 +346,7 @@ async function githubApiRequest<T = unknown>(path: string, token: string, init: 
     signal: AbortSignal.timeout(15_000)
   });
   const data = await response.json().catch(() => ({})) as T & { message?: string };
-  if (!response.ok) throw new Error(data.message || `GitHub API вернул ${response.status}`);
+  if (!response.ok) throw new GithubApiError(data.message || `GitHub API вернул ${response.status}`, response.status);
   return data;
 }
 
@@ -317,11 +355,21 @@ async function githubContentState(root: string, path: string, ref: string, token
     headers: { ...apiHeaders, Authorization: `Bearer ${token}` },
     signal: AbortSignal.timeout(15_000)
   });
-  if (response.status === 404) return null;
+  if (response.status === 404 || response.status === 409) return null;
   const data = await response.json().catch(() => ({})) as { sha?: string; type?: string; message?: string };
   if (!response.ok) throw new Error(data.message || `GitHub API вернул ${response.status}`);
   if (data.type !== "file" || !data.sha) throw new Error(`${path} не является обычным файлом.`);
   return { sha: data.sha };
+}
+
+async function githubDefaultBranchSha(root: string, defaultBranch: string, token: string): Promise<string | null> {
+  try {
+    const reference = await githubRequest<{ object?: { sha?: string } }>(`${root}/git/ref/heads/${encodeURIComponent(defaultBranch)}`, token);
+    return reference.object?.sha || null;
+  } catch (error) {
+    if (error instanceof GithubApiError && (error.status === 404 || error.status === 409)) return null;
+    throw error;
+  }
 }
 
 function encodeRepositoryPath(path: string): string {
