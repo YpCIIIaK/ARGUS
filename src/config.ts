@@ -5,6 +5,7 @@ const booleanString = z
   .enum(["true", "false"])
   .default("false")
   .transform((value) => value === "true");
+const reasoningEffort = z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 const timeZone = z.string().default("Asia/Qyzylorda").refine((value) => {
   try {
@@ -39,6 +40,11 @@ const schema = z.object({
   CREATIVE_MODEL: z.string().optional(),
   RESEARCHER_MODEL: z.string().optional(),
   COORDINATOR_MODEL: z.string().optional(),
+  PROGRAMMER_EFFORT: reasoningEffort.default("low"),
+  ENGINEER_EFFORT: reasoningEffort.default("low"),
+  CREATIVE_EFFORT: reasoningEffort.default("low"),
+  RESEARCHER_EFFORT: reasoningEffort.default("low"),
+  COORDINATOR_EFFORT: reasoningEffort.default("low"),
   GITHUB_CLIENT_ID: z.string().optional(),
   GITHUB_CLIENT_SECRET: z.string().optional(),
   GITHUB_APP_SLUG: z.string().optional(),

@@ -1,4 +1,5 @@
 import type { Agent } from "./agents.js";
+import type { ReasoningEffort } from "./agents.js";
 import { config } from "./config.js";
 
 export type ContextMessage = { author: string; content: string };
@@ -32,6 +33,10 @@ export type AgentResponse = {
     costUsd: number;
   };
 };
+
+export function openRouterEffort(effort: ReasoningEffort): Exclude<ReasoningEffort, "max"> {
+  return effort === "max" ? "xhigh" : effort;
+}
 
 export function currentDateTimeContext(now = new Date()): string {
   const local = new Intl.DateTimeFormat("ru-RU", {
@@ -83,7 +88,7 @@ export async function askAgent(
       ],
       temperature: agent.id === "creative" ? 0.9 : 0.55,
       max_tokens: maxTokens,
-      reasoning: { effort: "low", exclude: true }
+      reasoning: { effort: openRouterEffort(agent.effort), exclude: true }
     })
   } satisfies RequestInit;
 

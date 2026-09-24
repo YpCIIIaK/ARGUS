@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { claudeCodeModel, isClaudeCodeModel, parseClaudeCodeResult } from "./claude-code.js";
+import { claudeCodeEffort, claudeCodeModel, isClaudeCodeModel, parseClaudeCodeResult } from "./claude-code.js";
 
 test("recognizes Claude Code subscription model identifiers", () => {
   assert.equal(isClaudeCodeModel("claude-code/sonnet"), true);
   assert.equal(isClaudeCodeModel("anthropic/claude-sonnet"), false);
   assert.equal(claudeCodeModel("claude-code/opus"), "opus");
+});
+
+test("maps unsupported low-end effort values to Claude Code low", () => {
+  assert.equal(claudeCodeEffort("none"), "low");
+  assert.equal(claudeCodeEffort("minimal"), "low");
+  assert.equal(claudeCodeEffort("max"), "max");
 });
 
 test("parses Claude Code JSON usage", () => {

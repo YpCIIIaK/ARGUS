@@ -18,7 +18,7 @@ import {
   WebhookClient
 } from "discord.js";
 import { parseAgentActions, type GeneratedFile, type GeneratedPdf } from "./agent-actions.js";
-import { agents, selectAgents, type Agent } from "./agents.js";
+import { agents, reasoningEfforts, selectAgents, type Agent, type ReasoningEffort } from "./agents.js";
 import { formatBountyRun, getBountyStatus, startBountyScan } from "./bounty.js";
 import { config } from "./config.js";
 import { routeRequest } from "./decision-engine.js";
@@ -266,7 +266,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "claude") {
     await message.reply(config.claudeCodeConfigured
-      ? "Claude Code через подписку подключён. Чтобы назначить его агенту, укажи в панели настроек модель `claude-code/sonnet` или `claude-code/opus`."
+      ? "Claude Code через подписку подключён. Доступны `claude-code/sonnet`, `claude-code/opus` и точная модель `claude-code/claude-opus-5-5`. Модель и effort меняются через `!settings`."
       : "Claude Code не подключён: добавь секрет `CLAUDE_CODE_OAUTH_TOKEN`, созданный командой `claude setup-token`.");
     return;
   }
@@ -278,12 +278,13 @@ async function handleCommand(message: Message, store: Store) {
     await message.reply(await formatChannelStatus(store, message.channelId, channelAgent));
     return;
   }
-  if (command === "model") {
+  if (command === "model" || command === "effort") {
     if (!channelAgent) {
       await message.reply("Открой персональный канал агента, чтобы посмотреть его модель.");
       return;
     }
-    await message.reply(`**${channelAgent.name}** использует модель \`${runtimeAgent(store, channelAgent).model}\`.`);
+    const configured = runtimeAgent(store, channelAgent);
+    await message.reply(`**${channelAgent.name}** использует модель \`${configured.model}\`, effort \`${configured.effort}\`.`);
     return;
   }
   if (command === "clear") {
@@ -356,7 +357,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "help") {
     await message.reply(
-      "Команды: `!discuss <тема>`, `!tasks`, `!router`, `!claude`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!purge [1-100]`, `!clearall [1-100]`, `!pause`, `!resume`."
+      "Команды: `!discuss <тема>`, `!tasks`, `!router`, `!claude`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!effort`, `!compact`, `!clear`, `!purge [1-100]`, `!clearall [1-100]`, `!pause`, `!resume`."
     );
     return;
   }
@@ -913,7 +914,12 @@ function agentForChannel(message: Message): Agent | undefined {
 }
 
 function runtimeAgent(store: Store, agent: Agent): Agent {
-  return { ...agent, model: store.getSetting(`agent_model:${agent.id}`) || agent.model };
+  const savedEffort = store.getSetting(`agent_effort:${agent.id}`);
+  return {
+    ...agent,
+    model: store.getSetting(`agent_model:${agent.id}`) || agent.model,
+    effort: reasoningEfforts.includes(savedEffort as ReasoningEffort) ? savedEffort as ReasoningEffort : agent.effort
+  };
 }
 
 function capabilityLabel(capability: Agent["capabilities"][number]): string {
@@ -1249,6 +1255,22 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
     );
     return;
   }
+  if (interaction.isButton() && action === "effort" && agent) {
+    const input = new TextInputBuilder()
+      .setCustomId("effort")
+      .setLabel("Effort: none…max")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setValue(runtimeAgent(store, agent).effort)
+      .setPlaceholder("medium");
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId(`settings:effort_submit:${agent.id}`)
+        .setTitle(`Effort: ${agent.name}`)
+        .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input))
+    );
+    return;
+  }
   if (interaction.isButton() && action === "context" && agent) {
     const value = store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES);
     const input = new TextInputBuilder()
@@ -1316,6 +1338,13 @@ async function handleSettingsInteraction(interaction: Interaction, store: Store)
     await interaction.reply({ content: `Модель агента **${agent.name}** изменена на \`${model}\`.`, flags: MessageFlags.Ephemeral });
     return;
   }
+  if (interaction.isModalSubmit() && action === "effort_submit" && agent) {
+    const effort = interaction.fields.getTextInputValue("effort").trim().toLowerCase() as ReasoningEffort;
+    if (!reasoningEfforts.includes(effort)) throw new Error(`допустимые значения: ${reasoningEfforts.join(", ")}`);
+    await store.setSetting(`agent_effort:${agent.id}`, effort);
+    await interaction.reply({ content: `Effort агента **${agent.name}** изменён на \`${effort}\`.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
   if (interaction.isModalSubmit() && action === "context_submit" && agent) {
     const limit = boundedNumber(interaction.fields.getTextInputValue("context_limit"), 4, 100, "лимит контекста");
     await store.setSetting(`context_limit:${agent.id}`, String(limit));
@@ -1343,6 +1372,7 @@ async function buildAgentSettings(store: Store, guild: Guild, agent: Agent) {
   const description = [
     `Канал: **#${agent.channelName}**${channelId ? "" : " — не найден"}`,
     `Модель: \`${configured.model}\``,
+    `Effort: \`${configured.effort}\``,
     `Лимит контекста: **${contextLimit} сообщений**`,
     stats ? `Использовано: **${stats.allTime.totalTokens.toLocaleString("ru-RU")}** токенов · **$${stats.allTime.costUsd.toFixed(6)}**` : "Статистика пока недоступна"
   ].join("\n");
@@ -1350,6 +1380,7 @@ async function buildAgentSettings(store: Store, guild: Guild, agent: Agent) {
     embeds: [new EmbedBuilder().setTitle(`${agent.emoji} ${agent.name}`).setDescription(description).setColor(agent.color)],
     components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`settings:model:${agent.id}`).setLabel("Изменить модель").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`settings:effort:${agent.id}`).setLabel("Effort").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId(`settings:context:${agent.id}`).setLabel("Контекст").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`settings:compact:${agent.id}`).setLabel("Сжать").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`settings:clear:${agent.id}`).setLabel("Очистить").setStyle(ButtonStyle.Danger)
@@ -1397,6 +1428,7 @@ async function formatChannelStatus(store: Store, channelId: string, agent: Agent
   return [
     `**${agent.emoji} ${agent.name}**`,
     `Модель: \`${models}\``,
+    `Effort: \`${configured.effort}\``,
     `Сессия: ${sessionStart}`,
     `Сообщений в контексте: **${stats.contextMessages}**`,
     `Лимит контекста: **${store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES)}**`,

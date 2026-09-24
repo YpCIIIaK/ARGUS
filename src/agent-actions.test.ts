@@ -4,7 +4,7 @@ import type { Agent, AgentCapability, AgentId } from "./agents.js";
 import { parseAgentActions } from "./agent-actions.js";
 
 function mockAgent(id: AgentId, capabilities: AgentCapability[]): Agent {
-  return { id, capabilities, name: id, channelName: id, emoji: "🤖", color: 0, model: "test", prompt: "test", keywords: [] };
+  return { id, capabilities, name: id, channelName: id, emoji: "🤖", color: 0, model: "test", effort: "low", prompt: "test", keywords: [] };
 }
 
 test("programmer can create a safe Discord attachment", () => {

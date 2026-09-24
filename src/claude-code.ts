@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
-import type { Agent } from "./agents.js";
+import type { Agent, ReasoningEffort } from "./agents.js";
 import { config } from "./config.js";
 import { currentDateTimeContext, type AgentResponse, type ContextMessage } from "./openrouter.js";
 
@@ -25,6 +25,10 @@ export function isClaudeCodeModel(model: string): boolean {
 export function claudeCodeModel(model: string): string {
   const selected = model.slice("claude-code/".length).trim();
   return selected || "sonnet";
+}
+
+export function claudeCodeEffort(effort: ReasoningEffort): "low" | "medium" | "high" | "xhigh" | "max" {
+  return effort === "none" || effort === "minimal" ? "low" : effort;
 }
 
 export function parseClaudeCodeResult(stdout: string, requestedModel: string): AgentResponse {
@@ -79,7 +83,7 @@ export async function askClaudeCode(
     "-p",
     "--output-format", "json",
     "--model", model,
-    "--effort", "low",
+    "--effort", claudeCodeEffort(agent.effort),
     "--no-session-persistence",
     "--safe-mode",
     "--strict-mcp-config",

@@ -2,6 +2,8 @@ import { config } from "./config.js";
 
 export type AgentId = "programmer" | "engineer" | "creative" | "researcher" | "coordinator";
 export type AgentCapability = "create_file" | "create_pdf" | "write_code" | "github_files" | "web_search" | "web_read" | "architecture" | "creative_content" | "research" | "coordination";
+export const reasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ReasoningEffort = typeof reasoningEfforts[number];
 
 export type Agent = {
   id: AgentId;
@@ -10,6 +12,7 @@ export type Agent = {
   emoji: string;
   color: number;
   model: string;
+  effort: ReasoningEffort;
   prompt: string;
   keywords: string[];
   capabilities: AgentCapability[];
@@ -25,6 +28,7 @@ export const agents: Agent[] = [
     emoji: "💻",
     color: 0x4f8cff,
     model: config.PROGRAMMER_MODEL || config.DEFAULT_MODEL,
+    effort: config.PROGRAMMER_EFFORT,
     keywords: ["код", "программ", "бот", "api", "база", "ошибка", "typescript", "python", "реализац"],
     capabilities: ["create_file", "create_pdf", "write_code", "github_files"],
     prompt: `${common}\nТы Программист. Предлагай конкретную реализацию, структуру кода и технические шаги. Замечай риски безопасности и поддержки.`
@@ -36,6 +40,7 @@ export const agents: Agent[] = [
     emoji: "⚙️",
     color: 0xf59e0b,
     model: config.ENGINEER_MODEL || config.DEFAULT_MODEL,
+    effort: config.ENGINEER_EFFORT,
     keywords: ["архитект", "система", "огранич", "нагруз", "инжен", "хост", "сервер", "масштаб"],
     capabilities: ["architecture"],
     prompt: `${common}\nТы Инженер. Проверяй осуществимость, архитектуру, ограничения, отказоустойчивость и цену решений.`
@@ -47,6 +52,7 @@ export const agents: Agent[] = [
     emoji: "🎨",
     color: 0xec4899,
     model: config.CREATIVE_MODEL || config.DEFAULT_MODEL,
+    effort: config.CREATIVE_EFFORT,
     keywords: ["идея", "придум", "название", "дизайн", "концеп", "креатив", "контент"],
     capabilities: ["creative_content"],
     prompt: `${common}\nТы Креативщик. Предлагай оригинальные, но осуществимые идеи, форматы и альтернативы.`
@@ -58,6 +64,7 @@ export const agents: Agent[] = [
     emoji: "🔎",
     color: 0x10b981,
     model: config.RESEARCHER_MODEL || config.DEFAULT_MODEL,
+    effort: config.RESEARCHER_EFFORT,
     keywords: ["исслед", "проверь", "факт", "сравни", "найди", "анализ", "источник"],
     capabilities: ["research", "web_search", "web_read"],
     prompt: `${common}\nТы Исследователь. Отделяй известные факты от предположений, проверяй актуальные сведения через веб-инструменты и указывай ссылки на использованные источники.`
@@ -69,6 +76,7 @@ export const agents: Agent[] = [
     emoji: "🧭",
     color: 0x8b5cf6,
     model: config.COORDINATOR_MODEL || config.DEFAULT_MODEL,
+    effort: config.COORDINATOR_EFFORT,
     keywords: ["задача", "план", "итог", "решение", "координ", "статус", "обсуд"],
     capabilities: ["coordination"],
     prompt: `${common}\nТы Координатор. Уточняй цель, соединяй предложения команды, фиксируй решения и следующие шаги.`
