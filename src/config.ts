@@ -6,11 +6,21 @@ const booleanString = z
   .default("false")
   .transform((value) => value === "true");
 
+const timeZone = z.string().default("Asia/Qyzylorda").refine((value) => {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}, "must be a valid IANA time zone");
+
 const schema = z.object({
   DISCORD_TOKEN: z.string().min(1),
   OPENROUTER_API_KEY: z.string().min(1),
   DATABASE_URL: z.string().optional(),
   PORT: z.coerce.number().int().positive().default(10000),
+  TIME_ZONE: timeZone,
   ALLOWED_CHANNEL_IDS: z.string().default(""),
   OWNER_IDS: z.string().default(""),
   BOUNTY_CHANNEL_ID: z.string().optional(),

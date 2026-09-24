@@ -33,6 +33,16 @@ export type AgentResponse = {
   };
 };
 
+export function currentDateTimeContext(now = new Date()): string {
+  const local = new Intl.DateTimeFormat("ru-RU", {
+    timeZone: config.TIME_ZONE,
+    dateStyle: "full",
+    timeStyle: "long",
+    hourCycle: "h23"
+  }).format(now);
+  return `Текущая дата и время на момент запроса: ${local} (${config.TIME_ZONE}). UTC: ${now.toISOString()}. Используй эти значения как актуальные; не подменяй их датой из истории диалога или из обучающих данных.`;
+}
+
 function readText(content: string | Array<{ type?: string; text?: string }> | null | undefined): string {
   if (typeof content === "string") return content.trim();
   if (Array.isArray(content)) {
@@ -60,7 +70,7 @@ export async function askAgent(
     body: JSON.stringify({
       model: agent.model,
       messages: [
-        { role: "system", content: agent.prompt },
+        { role: "system", content: `${agent.prompt}\n\n${currentDateTimeContext()}` },
         {
           role: "user",
           content: `ИСТОРИЯ ДЛЯ КОНТЕКСТА (может содержать старые завершённые темы):\n${transcript}\n\nАКТУАЛЬНЫЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n${currentRequest}\n\nВыполни именно актуальный запрос как ${agent.name}. Не продолжай старую тему, если пользователь прямо не попросил об этом. Соблюдай требуемые краткость и формат буквально.`
