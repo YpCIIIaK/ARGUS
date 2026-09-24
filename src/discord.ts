@@ -17,7 +17,7 @@ import {
   type TextChannel,
   WebhookClient
 } from "discord.js";
-import { parseAgentActions, type GeneratedFile } from "./agent-actions.js";
+import { parseAgentActions, type GeneratedFile, type GeneratedPdf } from "./agent-actions.js";
 import { agents, selectAgents, type Agent } from "./agents.js";
 import { formatBountyRun, getBountyStatus, startBountyScan } from "./bounty.js";
 import { config } from "./config.js";
@@ -645,23 +645,7 @@ async function executeAgentWorkflow(input: {
     ? `↩️ **@${requestedBy.name}**, ${parsed.content || "запрошенные файлы готовы."}`
     : parsed.content;
   if (visibleContent || parsed.files.length) await emit({ agent: configuredAgent, content: visibleContent, files: parsed.files });
-  for (const pdf of parsed.pdfs) {
-    if (signal.aborted) break;
-    state.progress.push(`📄 ${agent.emoji} ${agent.name}: создаёт PDF в CodeSandbox`);
-    await updateProgress();
-    await message.reply(`📄 **${agent.name} → Песочница:** собираю **${pdf.name}** в изолированной VM…`);
-    try {
-      const generated = await runPdfSandbox(pdf.content, signal);
-      const sent = await (message.channel as TextChannel).send({
-        content: `✅ **Песочница → ${agent.name}:** PDF создан за **${(generated.run.durationMs / 1000).toFixed(1)} с**, VM остановлена.`,
-        files: [{ attachment: Buffer.from(generated.file), name: pdf.name }],
-        allowedMentions: { parse: [] }
-      });
-      await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: `Создан PDF: ${pdf.name}` });
-    } catch (error) {
-      await message.reply(`Не удалось создать PDF **${pdf.name}**: ${errorMessage(error)}`);
-    }
-  }
+  await publishGeneratedPdfs(message, store, configuredAgent, parsed.pdfs, signal, state, updateProgress);
   if (parsed.githubChanges.length) {
     try {
       const pending = await prepareGithubFileChanges(store, message.author.id, parsed.githubChanges);
@@ -744,16 +728,56 @@ async function resumeAfterDelegation(input: {
     const fileNames = result.files.map((file) => file.name).join(", ") || "нет";
     return `${helper.name}:\n${result.content || "Ответ без текста"}\nСозданные файлы: ${fileNames}`;
   }).join("\n\n").slice(0, 20_000);
+  const availableTools = agentToolReminder(agent);
   const result = await askAgent(
     agent,
     context,
-    `Помощники завершили подзадачи. Их ответы:\n\n${reports}\n\nИсходная задача пользователя:\n${originalRequest}\n\nТеперь ответь пользователю от своего имени: кратко подведи итог, укажи созданные файлы и не запрашивай новую помощь. Не используй служебные блоки DELEGATE.`,
+    `Помощники завершили подзадачи. Их ответы:\n\n${reports}\n\nИсходная задача пользователя:\n${originalRequest}\n\nТвои инструменты всё ещё доступны на этом шаге:\n${availableTools}\n\nТеперь заверши исходную задачу, используя нужный инструмент. Не утверждай, что инструмент недоступен, если он перечислен выше. Не запрашивай новую помощь и не используй DELEGATE.`,
     store.getNumberSetting("max_output_tokens", 30_000),
     signal
   );
   await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
   const parsed = parseAgentActions(result.content, agent);
+  await publishGeneratedPdfs(message, store, agent, parsed.pdfs, signal);
   return { content: `📬 **Результаты помощников получены.**\n${parsed.content}`, files: parsed.files };
+}
+
+async function publishGeneratedPdfs(
+  message: Message,
+  store: Store,
+  agent: Agent,
+  pdfs: GeneratedPdf[],
+  signal: AbortSignal,
+  state?: WorkflowState,
+  updateProgress?: () => Promise<void>
+) {
+  for (const pdf of pdfs) {
+    if (signal.aborted) break;
+    state?.progress.push(`📄 ${agent.emoji} ${agent.name}: создаёт PDF в CodeSandbox`);
+    await updateProgress?.();
+    await message.reply(`📄 **${agent.name} → Песочница:** собираю **${pdf.name}** в изолированной VM…`);
+    try {
+      const generated = await runPdfSandbox(pdf.content, signal);
+      const sent = await (message.channel as TextChannel).send({
+        content: `✅ **Песочница → ${agent.name}:** PDF создан за **${(generated.run.durationMs / 1000).toFixed(1)} с**, VM остановлена.`,
+        files: [{ attachment: Buffer.from(generated.file), name: pdf.name }],
+        allowedMentions: { parse: [] }
+      });
+      await store.addMessage({ channelId: message.channelId, discordMessageId: sent.id, author: agent.name, content: `Создан PDF: ${pdf.name}` });
+    } catch (error) {
+      await message.reply(`Не удалось создать PDF **${pdf.name}**: ${errorMessage(error)}`);
+    }
+  }
+}
+
+function agentToolReminder(agent: Agent): string {
+  const tools = agent.capabilities.map(capabilityLabel).join(", ") || "нет инструментов";
+  const protocols: string[] = [`Доступные возможности: ${tools}.`];
+  if (agent.capabilities.includes("create_file")) protocols.push('[CREATE_FILE name="file.ext"]полное содержимое[/CREATE_FILE]');
+  if (agent.capabilities.includes("create_pdf")) protocols.push('[CREATE_PDF name="article.pdf"]полный документ в Markdown[/CREATE_PDF]');
+  if (agent.capabilities.includes("github_files")) protocols.push('[GITHUB_READ path="path"][/GITHUB_READ] и GITHUB_FILE для подтверждаемого изменения');
+  if (agent.capabilities.includes("web_search")) protocols.push('[WEB_SEARCH query="запрос"][/WEB_SEARCH] и [WEB_READ url="https://..."][/WEB_READ]');
+  return protocols.join("\n");
 }
 
 async function publishAgentExecution(message: Message, store: Store, execution: AgentExecution) {
