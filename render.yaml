@@ -22,10 +22,7 @@ services:
       - key: JINA_API_KEY
         sync: false
       - key: SEARXNG_URL
-        fromService:
-          type: web
-          name: argus-search
-          property: hostport
+        value: https://argus-search.onrender.com
       - fromGroup: argus-search-auth
       - key: DATABASE_URL
         sync: false
