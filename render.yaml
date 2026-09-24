@@ -1,3 +1,9 @@
+envVarGroups:
+  - name: argus-search-auth
+    envVars:
+      - key: SEARXNG_TOKEN
+        generateValue: true
+
 services:
   - type: web
     name: forumds
@@ -15,6 +21,12 @@ services:
         sync: false
       - key: JINA_API_KEY
         sync: false
+      - key: SEARXNG_URL
+        fromService:
+          type: web
+          name: argus-search
+          property: hostport
+      - fromGroup: argus-search-auth
       - key: DATABASE_URL
         sync: false
       - key: BOUNTY_CHANNEL_ID
@@ -37,3 +49,15 @@ services:
         value: openrouter/auto
       - key: AUTONOMOUS_ENABLED
         value: "false"
+
+  - type: web
+    name: argus-search
+    runtime: docker
+    plan: free
+    dockerfilePath: ./search-service/Dockerfile
+    dockerContext: ./search-service
+    healthCheckPath: /health
+    envVars:
+      - fromGroup: argus-search-auth
+      - key: SEARXNG_SECRET
+        generateValue: true

@@ -33,6 +33,8 @@ const schema = z.object({
   GITHUB_CALLBACK_URL: z.preprocess((value) => value === "" ? undefined : value, z.string().url().optional()),
   GITHUB_TOKEN_ENCRYPTION_KEY: z.string().optional(),
   JINA_API_KEY: z.string().optional(),
+  SEARXNG_URL: z.string().optional(),
+  SEARXNG_TOKEN: z.string().optional(),
   MAX_AGENT_REPLIES: z.coerce.number().int().min(1).max(10).default(5),
   MAX_CONTEXT_MESSAGES: z.coerce.number().int().min(4).max(100).default(20),
   DAILY_REQUEST_LIMIT: z.coerce.number().int().positive().default(100),
@@ -61,6 +63,10 @@ if (githubConfigured) {
     console.error("GITHUB_TOKEN_ENCRYPTION_KEY must contain exactly 32 random bytes encoded as base64 or hex");
     process.exit(1);
   }
+}
+if (Boolean(env.SEARXNG_URL) !== Boolean(env.SEARXNG_TOKEN)) {
+  console.error("Self-hosted web search requires SEARXNG_URL and SEARXNG_TOKEN together");
+  process.exit(1);
 }
 
 export const config = {
