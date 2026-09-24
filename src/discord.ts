@@ -756,7 +756,7 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
         return true;
       }
       const shown = repositories.slice(0, 15);
-      const lines = shown.map((repo) => `${repo.private ? "🔒" : "🌐"} [${repo.full_name}](<${repo.html_url}>) · \`${repo.default_branch}\` · Contents: **${repo.contentsPermission}**`);
+      const lines = shown.map((repo) => `${repo.private ? "🔒" : "🌐"} [${repo.full_name}](<${repo.html_url}>) · \`${repo.default_branch}\` · Contents: **${repo.contentsPermission}** · PR: **${repo.pullRequestsPermission}**`);
       if (repositories.length > shown.length) lines.push(`…и ещё ${repositories.length - shown.length}.`);
       const select = new StringSelectMenuBuilder()
         .setCustomId(`github:select_repo:${interaction.user.id}`)
@@ -802,10 +802,23 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
         if (interaction.message.editable) await interaction.message.edit({ content: "🚫 Пакет изменений GitHub отменён пользователем.", components: [] });
       } else {
         const result = await applyGithubFileChanges(store, interaction.user.id, operationId);
-        await interaction.editReply(result.initializedDefault
-          ? `Пустой репозиторий инициализирован первым коммитом в \`${result.branch}\`.`
-          : `Изменения применены в отдельной ветке \`${result.branch}\`.`);
-        if (interaction.message.editable) await interaction.message.edit({ content: `✅ Изменено файлов: **${result.changed}** в \`${result.repo}\`. ${result.initializedDefault ? "Создан первый коммит в основной ветке" : "Ветка"}: [${result.branch}](<${result.url}>)`, components: [] });
+        const privateResult = result.initializedDefault
+          ? `Пустой репозиторий инициализирован первым коммитом в \`${result.branch}\`. Следующее изменение уже сможет создать Pull Request.`
+          : result.pullRequest
+            ? `Изменения применены в \`${result.branch}\`, создан черновик Pull Request #${result.pullRequest.number}.`
+            : `Изменения применены в \`${result.branch}\`, но Pull Request создать не удалось: ${result.pullRequestError || "неизвестная ошибка"}`;
+        await interaction.editReply(privateResult);
+        if (interaction.message.editable) {
+          const components = result.pullRequest
+            ? [new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setLabel(`Открыть Pull Request #${result.pullRequest.number}`).setEmoji("🔎").setStyle(ButtonStyle.Link).setURL(result.pullRequest.url))]
+            : [];
+          const outcome = result.initializedDefault
+            ? `Создан первый коммит в основной ветке: [${result.branch}](<${result.url}>)`
+            : result.pullRequest
+              ? `Создан черновик Pull Request **#${result.pullRequest.number}** из ветки \`${result.branch}\``
+              : `Ветка [${result.branch}](<${result.url}>) создана, но Pull Request не создан`;
+          await interaction.message.edit({ content: `✅ Изменено файлов: **${result.changed}** в \`${result.repo}\`. ${outcome}.`, components });
+        }
       }
     } catch (error) {
       await interaction.editReply(`Не удалось обработать изменения: ${errorMessage(error)}`);

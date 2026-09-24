@@ -18,10 +18,10 @@ type TokenResponse = {
 };
 
 type GithubUser = { id: number; login: string };
-type GithubInstallation = { id: number; account?: { login?: string }; repository_selection?: string; permissions?: { contents?: string } };
+type GithubInstallation = { id: number; account?: { login?: string }; repository_selection?: string; permissions?: { contents?: string; pull_requests?: string } };
 type GithubRepository = { id: number; full_name: string; private: boolean; html_url: string; default_branch: string };
 
-export type GithubRepo = GithubRepository & { installationId: number; account: string; selection: string; contentsPermission: string };
+export type GithubRepo = GithubRepository & { installationId: number; account: string; selection: string; contentsPermission: string; pullRequestsPermission: string };
 type PendingGithubChange = { repo: string; changes: GithubFileChange[]; requestedAt: string; emptyRepository: boolean };
 class GithubApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -91,7 +91,8 @@ export async function listGithubRepositories(store: Store, discordUserId: string
         installationId: installation.id,
         account: installation.account?.login || "unknown",
         selection: installation.repository_selection || "selected",
-        contentsPermission: installation.permissions?.contents || "none"
+        contentsPermission: installation.permissions?.contents || "none",
+        pullRequestsPermission: installation.permissions?.pull_requests || "none"
       });
     }
   }
@@ -135,6 +136,9 @@ export async function prepareGithubFileChanges(
   const root = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`;
   const emptyRepository = !(await githubDefaultBranchSha(root, repository.default_branch, token));
   if (emptyRepository && changes.some((change) => change.action === "delete")) throw new Error("В пустом репозитории пока нечего удалять.");
+  if (!emptyRepository && repository.pullRequestsPermission !== "write") {
+    throw new Error("Для автоматического Pull Request требуется GitHub App permission Pull requests: Read and write. Подтверди новые права в Installed GitHub Apps и переподключи аккаунт.");
+  }
   const id = randomBytes(12).toString("base64url");
   const expiresAt = new Date(Date.now() + 15 * 60_000);
   const payload: PendingGithubChange = { repo, changes: changes.slice(0, 10), requestedAt: new Date().toISOString(), emptyRepository };
@@ -194,7 +198,7 @@ export async function applyGithubFileChanges(
   store: Store,
   discordUserId: string,
   id: string
-): Promise<{ repo: string; branch: string; url: string; changed: number; initializedDefault: boolean }> {
+): Promise<{ repo: string; branch: string; url: string; changed: number; initializedDefault: boolean; pullRequest?: { number: number; url: string; title: string }; pullRequestError?: string }> {
   const encrypted = await store.consumeGithubPendingChange(id, discordUserId);
   if (!encrypted) throw new Error("Пакет изменений не найден, уже обработан или просрочен.");
   const pending = JSON.parse(decryptToken(encrypted)) as PendingGithubChange;
@@ -261,12 +265,38 @@ export async function applyGithubFileChanges(
       });
     }
   }
+  const pullTitle = githubPullRequestTitle(pending.changes);
+  const pullBody = [
+    "## Изменения",
+    "",
+    ...pending.changes.map((change) => `- ${change.action === "delete" ? "Удалить" : "Создать или обновить"} \`${change.path}\``),
+    "",
+    "Пакет подготовлен агентом ARGUS и применён после подтверждения пользователя в Discord.",
+    "",
+    `Исходная ветка: \`${branch}\``,
+    `Базовая ветка: \`${defaultBranch}\``
+  ].join("\n");
+  let pullRequest: { number: number; url: string; title: string } | undefined;
+  let pullRequestError: string | undefined;
+  try {
+    const pull = await githubApiRequest<{ number?: number; html_url?: string; title?: string }>(`${root}/pulls`, token, {
+      method: "POST",
+      body: JSON.stringify({ title: pullTitle, body: pullBody, head: branch, base: defaultBranch, draft: true })
+    });
+    if (!pull.number || !pull.html_url) throw new Error("GitHub не вернул данные Pull Request.");
+    pullRequest = { number: pull.number, url: pull.html_url, title: pull.title || pullTitle };
+  } catch (error) {
+    console.error("GitHub branch was updated but Pull Request creation failed", error);
+    pullRequestError = error instanceof Error ? error.message : String(error);
+  }
   return {
     repo: pending.repo,
     branch,
     url: `https://github.com/${pending.repo}/tree/${encodeURIComponent(branch)}`,
     changed: pending.changes.length,
-    initializedDefault: false
+    initializedDefault: false,
+    ...(pullRequest ? { pullRequest } : {}),
+    ...(pullRequestError ? { pullRequestError } : {})
   };
 }
 
@@ -387,6 +417,14 @@ async function githubDefaultBranchSha(root: string, defaultBranch: string, token
 
 function encodeRepositoryPath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
+}
+
+function githubPullRequestTitle(changes: GithubFileChange[]): string {
+  if (changes.length === 1) {
+    const change = changes[0]!;
+    return `ARGUS: ${change.action === "delete" ? "Delete" : "Update"} ${change.path}`.slice(0, 200);
+  }
+  return `ARGUS: Update ${changes.length} files`;
 }
 
 function callbackUrl(): string {
