@@ -281,16 +281,39 @@ async function handleCommand(message: Message, store: Store) {
     return;
   }
   if (command === "clear") {
-    if (!channelAgent) {
-      await message.reply("Контекст очищается отдельно в персональном канале агента.");
-      return;
-    }
     if (!isController(message)) {
       await message.reply("Очистка контекста доступна владельцам и администраторам сервера.");
       return;
     }
     await store.clearContext(message.channelId);
-    await message.reply(`Контекст ${channelAgent.name} очищен. Сообщения в самом Discord не удалялись; новая сессия началась сейчас.`);
+    await message.reply(channelAgent
+      ? `Контекст ${channelAgent.name} очищен. Сообщения Discord не удалялись; новая сессия началась сейчас.`
+      : "Контекст общего канала очищен. Сообщения Discord не удалялись; новая сессия началась сейчас.");
+    return;
+  }
+  if (command === "purge" || command === "clearall") {
+    if (!isController(message)) {
+      await message.reply("Удаление сообщений доступно владельцам и администраторам сервера.");
+      return;
+    }
+    const count = parsePurgeCount(rest[0]);
+    if (count === null) {
+      await message.reply("Количество должно быть целым числом от 1 до 100, например `!purge 50`.");
+      return;
+    }
+    if (command === "clearall") await store.clearContext(message.channelId);
+    const channel = message.channel as TextChannel;
+    if (typeof channel.bulkDelete !== "function") {
+      await message.reply("Discord не позволяет массово удалять сообщения в этом типе канала.");
+      return;
+    }
+    try {
+      const deleted = await channel.bulkDelete(count, true);
+      const confirmation = await channel.send(`🧹 Удалено сообщений: **${deleted.size}**.${command === "clearall" ? " Контекст ИИ также очищен." : " Контекст ИИ сохранён."}`);
+      setTimeout(() => void confirmation.delete().catch(() => undefined), 5_000).unref();
+    } catch (error) {
+      await message.reply(`Не удалось удалить сообщения: ${errorMessage(error)}. Проверь право бота **Manage Messages**.`);
+    }
     return;
   }
   if (command === "compact") {
@@ -327,7 +350,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "help") {
     await message.reply(
-      "Команды: `!discuss <тема>`, `!tasks`, `!router`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
+      "Команды: `!discuss <тема>`, `!tasks`, `!router`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!purge [1-100]`, `!clearall [1-100]`, `!pause`, `!resume`."
     );
     return;
   }
@@ -1324,6 +1347,12 @@ function boundedNumber(raw: string, min: number, max: number, label: string): nu
   const value = Number(raw.trim());
   if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${label}: нужно целое число от ${min} до ${max}`);
   return value;
+}
+
+export function parsePurgeCount(value?: string): number | null {
+  if (!value) return 50;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 100 ? parsed : null;
 }
 
 async function formatChannelStatus(store: Store, channelId: string, agent: Agent): Promise<string> {
