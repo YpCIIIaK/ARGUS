@@ -21,12 +21,19 @@ import { agents, selectAgents, type Agent } from "./agents.js";
 import { formatBountyRun, getBountyStatus, startBountyScan } from "./bounty.js";
 import { config } from "./config.js";
 import {
+  applyGithubFileChanges,
+  cancelGithubFileChanges,
   createGithubConnectUrl,
   disconnectGithub,
   githubConnectionStatus,
   githubInstallUrl,
   githubIsConfigured,
-  listGithubRepositories
+  listGithubRepositories,
+  prepareGithubFileChanges,
+  previewGithubFileChanges,
+  readSelectedGithubFiles,
+  selectGithubRepository,
+  selectedGithubRepository
 } from "./github.js";
 import { askAgent } from "./openrouter.js";
 import { Store } from "./store.js";
@@ -417,22 +424,47 @@ async function executeAgentWorkflow(input: {
   const dailyLimit = store.getNumberSetting("daily_request_limit", config.DAILY_REQUEST_LIMIT);
   if (!(await store.consumeRequest(dailyLimit))) throw new DailyLimitError();
   const configuredAgent = runtimeAgent(store, agent);
+  const githubRepo = agent.capabilities.includes("github_files") ? selectedGithubRepository(store, message.author.id) : null;
   const contextLimit = store.getNumberSetting(`context_limit:${agent.id}`, config.MAX_CONTEXT_MESSAGES);
   const context = [...(await store.recent(message.channelId, contextLimit)), ...extraContext];
-  const result = await askAgent(
+  let result = await askAgent(
     configuredAgent,
     context,
-    workflowRequest(configuredAgent, task, originalRequest, depth),
+    workflowRequest(configuredAgent, task, originalRequest, depth, githubRepo),
     store.getNumberSetting("max_output_tokens", 30_000),
     signal
   );
   await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
 
-  const parsed = parseAgentActions(result.content, agent);
+  let parsed = parseAgentActions(result.content, agent);
+  if (parsed.githubReads.length && githubRepo && !signal.aborted) {
+    state.progress.push(`📖 ${agent.emoji} ${agent.name}: читает ${parsed.githubReads.length} файл(а) из GitHub`);
+    await updateProgress();
+    const files = await readSelectedGithubFiles(store, message.author.id, parsed.githubReads);
+    if (!(await store.consumeRequest(dailyLimit))) throw new DailyLimitError();
+    const fileContext = files.map((file) => `--- ${file.path} ---\n${file.content}`).join("\n\n").slice(0, 500_000);
+    result = await askAgent(
+      configuredAgent,
+      context,
+      `${workflowRequest(configuredAgent, task, originalRequest, depth, githubRepo)}\n\nЗАПРОШЕННЫЕ ФАЙЛЫ ИЗ GITHUB:\n${fileContext}\n\nТеперь выполни задачу. Если меняешь прочитанный файл, верни его полное новое содержимое через GITHUB_FILE. Повторно читать файлы в этом запуске нельзя.`,
+      store.getNumberSetting("max_output_tokens", 30_000),
+      signal
+    );
+    await store.recordUsage({ channelId: message.channelId, agentId: agent.id, model: result.model, ...result.usage });
+    parsed = parseAgentActions(result.content, agent);
+  }
   const visibleContent = requestedBy && (parsed.content || parsed.files.length)
     ? `↩️ **@${requestedBy.name}**, ${parsed.content || "запрошенные файлы готовы."}`
     : parsed.content;
   if (visibleContent || parsed.files.length) await emit({ agent: configuredAgent, content: visibleContent, files: parsed.files });
+  if (parsed.githubChanges.length) {
+    try {
+      const pending = await prepareGithubFileChanges(store, message.author.id, parsed.githubChanges);
+      await sendGithubApproval(message, configuredAgent, pending, parsed.githubChanges);
+    } catch (error) {
+      await emit({ agent: configuredAgent, content: `Не удалось подготовить изменения GitHub: ${errorMessage(error)}`, files: [] });
+    }
+  }
   markProgressDone(state, agent, parsed.delegations.length);
   await updateProgress();
 
@@ -523,13 +555,36 @@ async function publishAgentExecution(message: Message, store: Store, execution: 
   }
 }
 
-function workflowRequest(agent: Agent, task: string, originalRequest: string, depth: number): string {
+function workflowRequest(agent: Agent, task: string, originalRequest: string, depth: number, githubRepo: string | null): string {
   const roster = agents.map((item) => `${item.id} (${item.name}): ${item.capabilities.join(", ")}`).join("; ");
   const own = agent.capabilities.length ? agent.capabilities.join(", ") : "нет инструментов";
   const createFileProtocol = agent.capabilities.includes("create_file")
     ? `\nТы можешь создать файл. Для этого выведи блок:\n[CREATE_FILE name="filename.ext"]\nполное содержимое\n[/CREATE_FILE]\nПосле блока кратко объясни, что создано.`
     : "";
-  return `ИСХОДНАЯ ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${originalRequest}\n\nТВОЯ ТЕКУЩАЯ ПОДЗАДАЧА (уровень ${depth}):\n${task}\n\nТвои возможности: ${own}.\nКоманда: ${roster}.\nЕсли для выполнения действительно нужна возможность другого агента, передай ему одну конкретную подзадачу точным блоком:\n[DELEGATE agent="programmer"]\nчто именно требуется сделать и какие данные использовать\n[/DELEGATE]\nМожно заменить programmer на engineer, creative, researcher или coordinator. Не делегируй то, что способен сделать сам. Не вызывай самого себя. Не утверждай, что помощник уже выполнил задачу.${createFileProtocol}`;
+  const githubProtocol = agent.capabilities.includes("github_files") && githubRepo
+    ? `\nВыбран GitHub-репозиторий ${githubRepo}. Перед изменением существующего файла запроси его содержимое блоком [GITHUB_READ path="src/file.ts"][/GITHUB_READ]. За один запуск можно прочитать до пяти файлов. После чтения ты получишь их содержимое отдельным шагом. Ты можешь предложить создание или полную замену файла блоком:\n[GITHUB_FILE action="write" path="src/file.ts"]\nполное новое содержимое файла\n[/GITHUB_FILE]\nДля удаления используй:\n[GITHUB_FILE action="delete" path="old.txt"]\n[/GITHUB_FILE]\nКаждое изменение будет показано пользователю и применится только после кнопки подтверждения в отдельную ветку. Не заменяй существующий файл, пока не прочитал его полное содержимое.`
+    : agent.capabilities.includes("github_files")
+      ? "\nGitHub подключаемый инструмент доступен, но рабочий репозиторий не выбран. Попроси пользователя открыть `!github` → «Репозитории» и выбрать его."
+      : "";
+  return `ИСХОДНАЯ ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${originalRequest}\n\nТВОЯ ТЕКУЩАЯ ПОДЗАДАЧА (уровень ${depth}):\n${task}\n\nТвои возможности: ${own}.\nКоманда: ${roster}.\nЕсли для выполнения действительно нужна возможность другого агента, передай ему одну конкретную подзадачу точным блоком:\n[DELEGATE agent="programmer"]\nчто именно требуется сделать и какие данные использовать\n[/DELEGATE]\nМожно заменить programmer на engineer, creative, researcher или coordinator. Не делегируй то, что способен сделать сам. Не вызывай самого себя. Не утверждай, что помощник уже выполнил задачу.${createFileProtocol}${githubProtocol}`;
+}
+
+async function sendGithubApproval(
+  message: Message,
+  agent: Agent,
+  pending: { id: string; repo: string; expiresAt: Date },
+  changes: Array<{ action: "write" | "delete"; path: string }>
+) {
+  const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`github:review:${message.author.id}:${pending.id}`).setLabel("Просмотреть").setEmoji("👁️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`github:apply:${message.author.id}:${pending.id}`).setLabel("Применить в новой ветке").setEmoji("✅").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`github:cancel:${message.author.id}:${pending.id}`).setLabel("Отменить").setStyle(ButtonStyle.Danger)
+  );
+  await message.reply({
+    content: `${agent.emoji} **${agent.name} подготовил ${changes.length} изменение(я) GitHub.**\nНазвания приватного репозитория и файлов доступны владельцу через кнопку «Просмотреть». После подтверждения ARGUS создаст отдельную ветку. Пакет действует 15 минут.`,
+    components: [buttons],
+    allowedMentions: { parse: [] }
+  });
 }
 
 function markProgressDone(state: WorkflowState, agent: Agent, delegations: number) {
@@ -613,6 +668,7 @@ function capabilityLabel(capability: Agent["capabilities"][number]): string {
   return ({
     create_file: "создание файлов",
     write_code: "написание кода",
+    github_files: "файлы GitHub через подтверждение",
     architecture: "архитектура",
     creative_content: "креативный контент",
     research: "исследование",
@@ -667,8 +723,8 @@ async function handleInteraction(interaction: Interaction, store: Store) {
 }
 
 async function handleGithubInteraction(interaction: Interaction, store: Store): Promise<boolean> {
-  if (!interaction.isButton() || !interaction.customId.startsWith("github:")) return false;
-  const [, action, ownerId] = interaction.customId.split(":");
+  if ((!interaction.isButton() && !interaction.isStringSelectMenu()) || !interaction.customId.startsWith("github:")) return false;
+  const [, action, ownerId, operationId] = interaction.customId.split(":");
   if (ownerId !== interaction.user.id) {
     await interaction.reply({ content: "Эта кнопка относится к GitHub-подключению другого пользователя.", ephemeral: true });
     return true;
@@ -682,8 +738,9 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
   }
   if (action === "status") {
     const current = await githubConnectionStatus(store, interaction.user.id);
+    const selected = selectedGithubRepository(store, interaction.user.id);
     await interaction.reply({
-      content: current ? `Подключён GitHub **@${current.githubLogin}**.` : "GitHub не подключён. Нажми «Подключить».",
+      content: current ? `Подключён GitHub **@${current.githubLogin}**.\nРабочий репозиторий: ${selected ? `\`${selected}\`` : "не выбран"}.` : "GitHub не подключён. Нажми «Подключить».",
       ephemeral: true
     });
     return true;
@@ -700,9 +757,55 @@ async function handleGithubInteraction(interaction: Interaction, store: Store): 
       const shown = repositories.slice(0, 15);
       const lines = shown.map((repo) => `${repo.private ? "🔒" : "🌐"} [${repo.full_name}](<${repo.html_url}>) · \`${repo.default_branch}\``);
       if (repositories.length > shown.length) lines.push(`…и ещё ${repositories.length - shown.length}.`);
-      await interaction.editReply(`Репозитории, разрешённые GitHub App:\n${lines.join("\n")}`);
+      const select = new StringSelectMenuBuilder()
+        .setCustomId(`github:select_repo:${interaction.user.id}`)
+        .setPlaceholder("Выбрать рабочий репозиторий")
+        .addOptions(shown.map((repo) => ({
+          label: repo.full_name.slice(0, 100),
+          value: repo.full_name,
+          description: `${repo.private ? "Private" : "Public"} · ${repo.default_branch}`.slice(0, 100)
+        })));
+      await interaction.editReply({ content: `Репозитории, разрешённые GitHub App:\n${lines.join("\n")}\n\nВыбери один рабочий репозиторий:`, components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)] });
     } catch (error) {
       await interaction.editReply(`Не удалось получить репозитории: ${errorMessage(error)}`);
+    }
+    return true;
+  }
+  if (action === "select_repo" && interaction.isStringSelectMenu()) {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const repo = interaction.values[0];
+      if (!repo) throw new Error("Репозиторий не выбран.");
+      await selectGithubRepository(store, interaction.user.id, repo);
+      await interaction.editReply(`Рабочий репозиторий выбран: \`${repo}\`.`);
+    } catch (error) {
+      await interaction.editReply(`Не удалось выбрать репозиторий: ${errorMessage(error)}`);
+    }
+    return true;
+  }
+  if ((action === "review" || action === "apply" || action === "cancel") && operationId) {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      if (action === "review") {
+        const pending = await previewGithubFileChanges(store, interaction.user.id, operationId);
+        const preview = pending.changes.map((change) => change.action === "delete"
+          ? `DELETE ${change.path}\n`
+          : `WRITE ${change.path}\n${"=".repeat(72)}\n${change.content || ""}\n`).join("\n");
+        await interaction.editReply({
+          content: `Репозиторий: \`${pending.repo}\`\nПолное предлагаемое содержимое находится во вложении.`,
+          files: [{ attachment: Buffer.from(preview, "utf8"), name: "argus-github-preview.txt" }]
+        });
+      } else if (action === "cancel") {
+        await cancelGithubFileChanges(store, interaction.user.id, operationId);
+        await interaction.editReply("Изменения отменены.");
+        if (interaction.message.editable) await interaction.message.edit({ content: "🚫 Пакет изменений GitHub отменён пользователем.", components: [] });
+      } else {
+        const result = await applyGithubFileChanges(store, interaction.user.id, operationId);
+        await interaction.editReply(`Изменения применены в отдельной ветке \`${result.branch}\`.`);
+        if (interaction.message.editable) await interaction.message.edit({ content: `✅ Изменено файлов: **${result.changed}** в \`${result.repo}\`. Ветка: [${result.branch}](<${result.url}>)`, components: [] });
+      }
+    } catch (error) {
+      await interaction.editReply(`Не удалось обработать изменения: ${errorMessage(error)}`);
     }
     return true;
   }

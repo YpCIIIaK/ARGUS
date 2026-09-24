@@ -35,3 +35,30 @@ test("unknown agents and empty delegation tasks are ignored", () => {
   );
   assert.deepEqual(parsed.delegations, []);
 });
+
+test("programmer can propose safe GitHub writes and deletes", () => {
+  const programmer = mockAgent("programmer", ["github_files"]);
+  const parsed = parseAgentActions(
+    '[GITHUB_FILE action="write" path="src/app.ts"]\nexport const ok = true;\n[/GITHUB_FILE]\n[GITHUB_FILE action="delete" path="old.txt"]\n[/GITHUB_FILE]',
+    programmer
+  );
+  assert.deepEqual(parsed.githubChanges, [
+    { action: "write", path: "src/app.ts", content: "export const ok = true;" },
+    { action: "delete", path: "old.txt" }
+  ]);
+});
+
+test("GitHub file proposals reject traversal and secret paths", () => {
+  const programmer = mockAgent("programmer", ["github_files"]);
+  const parsed = parseAgentActions(
+    '[GITHUB_FILE action="write" path="../secret.txt"]x[/GITHUB_FILE]\n[GITHUB_FILE action="write" path=".env"]x[/GITHUB_FILE]',
+    programmer
+  );
+  assert.deepEqual(parsed.githubChanges, []);
+});
+
+test("programmer can request safe GitHub files before editing", () => {
+  const programmer = mockAgent("programmer", ["github_files"]);
+  const parsed = parseAgentActions('[GITHUB_READ path="src/index.ts"][/GITHUB_READ]\n[GITHUB_READ path="../.env"][/GITHUB_READ]', programmer);
+  assert.deepEqual(parsed.githubReads, ["src/index.ts"]);
+});

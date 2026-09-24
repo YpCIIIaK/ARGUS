@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { config } from "./config.js";
+import type { GithubFileChange } from "./agent-actions.js";
 import { decodeEncryptionKey, decryptSecret, encryptSecret } from "./secret-box.js";
 import { Store, type GithubConnection } from "./store.js";
 
@@ -21,6 +22,7 @@ type GithubInstallation = { id: number; account?: { login?: string }; repository
 type GithubRepository = { id: number; full_name: string; private: boolean; html_url: string; default_branch: string };
 
 export type GithubRepo = GithubRepository & { installationId: number; account: string; selection: string };
+type PendingGithubChange = { repo: string; changes: GithubFileChange[]; requestedAt: string };
 
 export function githubIsConfigured(): boolean {
   return config.githubConfigured;
@@ -88,6 +90,142 @@ export async function listGithubRepositories(store: Store, discordUserId: string
     }
   }
   return repositories.sort((a, b) => a.full_name.localeCompare(b.full_name));
+}
+
+export function selectedGithubRepository(store: Store, discordUserId: string): string | null {
+  return store.getSetting(`github_repo:${discordUserId}`) || null;
+}
+
+export async function selectGithubRepository(store: Store, discordUserId: string, fullName: string): Promise<void> {
+  const repositories = await listGithubRepositories(store, discordUserId);
+  if (!repositories.some((repository) => repository.full_name === fullName)) throw new Error("Этот репозиторий не разрешён установленному GitHub App.");
+  await store.setSetting(`github_repo:${discordUserId}`, fullName);
+}
+
+export async function prepareGithubFileChanges(
+  store: Store,
+  discordUserId: string,
+  changes: GithubFileChange[]
+): Promise<{ id: string; repo: string; expiresAt: Date }> {
+  if (!changes.length) throw new Error("Нет изменений для GitHub.");
+  const repo = selectedGithubRepository(store, discordUserId);
+  if (!repo) throw new Error("Сначала выбери репозиторий через `!github` → «Репозитории».");
+  const repositories = await listGithubRepositories(store, discordUserId);
+  if (!repositories.some((repository) => repository.full_name === repo)) {
+    await store.deleteSetting(`github_repo:${discordUserId}`);
+    throw new Error("Ранее выбранный репозиторий больше недоступен. Выбери его заново.");
+  }
+  if (new Set(changes.map((change) => change.path)).size !== changes.length) throw new Error("Один файл нельзя изменять несколько раз в одном пакете.");
+  const totalBytes = changes.reduce((sum, change) => sum + Buffer.byteLength(change.content || "", "utf8"), 0);
+  if (totalBytes > 5_000_000) throw new Error("Общий размер пакета изменений превышает 5 МБ.");
+  const id = randomBytes(12).toString("base64url");
+  const expiresAt = new Date(Date.now() + 15 * 60_000);
+  const payload: PendingGithubChange = { repo, changes: changes.slice(0, 10), requestedAt: new Date().toISOString() };
+  await store.saveGithubPendingChange(id, discordUserId, encryptToken(JSON.stringify(payload)), expiresAt);
+  return { id, repo, expiresAt };
+}
+
+export async function previewGithubFileChanges(store: Store, discordUserId: string, id: string): Promise<PendingGithubChange> {
+  const encrypted = await store.getGithubPendingChange(id, discordUserId);
+  if (!encrypted) throw new Error("Пакет изменений не найден, уже обработан или просрочен.");
+  return JSON.parse(decryptToken(encrypted)) as PendingGithubChange;
+}
+
+export async function readSelectedGithubFiles(
+  store: Store,
+  discordUserId: string,
+  paths: string[]
+): Promise<Array<{ path: string; content: string }>> {
+  const repoName = selectedGithubRepository(store, discordUserId);
+  if (!repoName) throw new Error("Рабочий репозиторий не выбран.");
+  const repositories = await listGithubRepositories(store, discordUserId);
+  const repository = repositories.find((item) => item.full_name === repoName);
+  if (!repository) throw new Error("Выбранный репозиторий больше недоступен.");
+  const connection = await requireConnection(store, discordUserId);
+  const token = await validAccessToken(store, connection);
+  const [owner, repo] = repoName.split("/");
+  if (!owner || !repo) throw new Error("Некорректное имя репозитория.");
+  const root = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const result: Array<{ path: string; content: string }> = [];
+  let totalBytes = 0;
+  for (const path of paths.slice(0, 5)) {
+    const data = await githubRequest<{ type?: string; size?: number; encoding?: string; content?: string; message?: string }>(
+      `${root}/contents/${encodeRepositoryPath(path)}?ref=${encodeURIComponent(repository.default_branch)}`,
+      token
+    );
+    if (data.type !== "file" || data.encoding !== "base64" || typeof data.content !== "string") throw new Error(`${path} не является доступным текстовым файлом.`);
+    const buffer = Buffer.from(data.content.replace(/\s/g, ""), "base64");
+    totalBytes += buffer.length;
+    if (buffer.length > 200_000 || totalBytes > 500_000) throw new Error("Файлы слишком большие для контекста агента.");
+    if (buffer.includes(0)) throw new Error(`${path} похож на бинарный файл.`);
+    result.push({ path, content: buffer.toString("utf8") });
+  }
+  return result;
+}
+
+export async function cancelGithubFileChanges(store: Store, discordUserId: string, id: string) {
+  await store.deleteGithubPendingChange(id, discordUserId);
+}
+
+export async function applyGithubFileChanges(
+  store: Store,
+  discordUserId: string,
+  id: string
+): Promise<{ repo: string; branch: string; url: string; changed: number }> {
+  const encrypted = await store.consumeGithubPendingChange(id, discordUserId);
+  if (!encrypted) throw new Error("Пакет изменений не найден, уже обработан или просрочен.");
+  const pending = JSON.parse(decryptToken(encrypted)) as PendingGithubChange;
+  const repositories = await listGithubRepositories(store, discordUserId);
+  const repository = repositories.find((item) => item.full_name === pending.repo);
+  if (!repository) throw new Error("Доступ к выбранному репозиторию отозван.");
+  const connection = await requireConnection(store, discordUserId);
+  const token = await validAccessToken(store, connection);
+  const [owner, repo] = pending.repo.split("/");
+  if (!owner || !repo) throw new Error("Некорректное имя репозитория.");
+  const root = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const defaultBranch = repository.default_branch;
+  const fileStates = new Map<string, { sha: string } | null>();
+  for (const change of pending.changes) {
+    const existing = await githubContentState(root, change.path, defaultBranch, token);
+    if (change.action === "delete" && !existing) throw new Error(`Нельзя удалить отсутствующий файл: ${change.path}`);
+    fileStates.set(change.path, existing);
+  }
+
+  const reference = await githubRequest<{ object?: { sha?: string } }>(`${root}/git/ref/heads/${encodeURIComponent(defaultBranch)}`, token);
+  const baseSha = reference.object?.sha;
+  if (!baseSha) throw new Error("GitHub не вернул SHA основной ветки.");
+  const branch = `argus/${new Date().toISOString().slice(0, 10)}-${id.slice(0, 6).toLowerCase()}`;
+  await githubApiRequest(`${root}/git/refs`, token, {
+    method: "POST",
+    body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseSha })
+  });
+
+  for (const change of pending.changes) {
+    const endpoint = `${root}/contents/${encodeRepositoryPath(change.path)}`;
+    const existing = fileStates.get(change.path);
+    if (change.action === "write") {
+      await githubApiRequest(endpoint, token, {
+        method: "PUT",
+        body: JSON.stringify({
+          message: `${existing ? "Update" : "Create"} ${change.path} via ARGUS`,
+          content: Buffer.from(change.content || "", "utf8").toString("base64"),
+          branch,
+          ...(existing ? { sha: existing.sha } : {})
+        })
+      });
+    } else {
+      await githubApiRequest(endpoint, token, {
+        method: "DELETE",
+        body: JSON.stringify({ message: `Delete ${change.path} via ARGUS`, sha: existing!.sha, branch })
+      });
+    }
+  }
+  return {
+    repo: pending.repo,
+    branch,
+    url: `https://github.com/${pending.repo}/tree/${encodeURIComponent(branch)}`,
+    changed: pending.changes.length
+  };
 }
 
 export async function disconnectGithub(store: Store, discordUserId: string): Promise<{ login: string; revoked: boolean }> {
@@ -160,13 +298,34 @@ async function requestTokens(parameters: Record<string, string>): Promise<TokenR
 }
 
 async function githubRequest<T>(path: string, token: string): Promise<T> {
+  return githubApiRequest<T>(path, token);
+}
+
+async function githubApiRequest<T = unknown>(path: string, token: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${githubApi}${path}`, {
-    headers: { ...apiHeaders, Authorization: `Bearer ${token}` },
+    ...init,
+    headers: { ...apiHeaders, Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...init.headers },
     signal: AbortSignal.timeout(15_000)
   });
   const data = await response.json().catch(() => ({})) as T & { message?: string };
   if (!response.ok) throw new Error(data.message || `GitHub API вернул ${response.status}`);
   return data;
+}
+
+async function githubContentState(root: string, path: string, ref: string, token: string): Promise<{ sha: string } | null> {
+  const response = await fetch(`${githubApi}${root}/contents/${encodeRepositoryPath(path)}?ref=${encodeURIComponent(ref)}`, {
+    headers: { ...apiHeaders, Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(15_000)
+  });
+  if (response.status === 404) return null;
+  const data = await response.json().catch(() => ({})) as { sha?: string; type?: string; message?: string };
+  if (!response.ok) throw new Error(data.message || `GitHub API вернул ${response.status}`);
+  if (data.type !== "file" || !data.sha) throw new Error(`${path} не является обычным файлом.`);
+  return { sha: data.sha };
+}
+
+function encodeRepositoryPath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
 }
 
 function callbackUrl(): string {

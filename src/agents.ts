@@ -1,7 +1,7 @@
 import { config } from "./config.js";
 
 export type AgentId = "programmer" | "engineer" | "creative" | "researcher" | "coordinator";
-export type AgentCapability = "create_file" | "write_code" | "architecture" | "creative_content" | "research" | "coordination";
+export type AgentCapability = "create_file" | "write_code" | "github_files" | "architecture" | "creative_content" | "research" | "coordination";
 
 export type Agent = {
   id: AgentId;
@@ -26,7 +26,7 @@ export const agents: Agent[] = [
     color: 0x4f8cff,
     model: config.PROGRAMMER_MODEL || config.DEFAULT_MODEL,
     keywords: ["код", "программ", "бот", "api", "база", "ошибка", "typescript", "python", "реализац"],
-    capabilities: ["create_file", "write_code"],
+    capabilities: ["create_file", "write_code", "github_files"],
     prompt: `${common}\nТы Программист. Предлагай конкретную реализацию, структуру кода и технические шаги. Замечай риски безопасности и поддержки.`
   },
   {

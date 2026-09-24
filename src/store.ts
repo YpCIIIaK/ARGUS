@@ -45,6 +45,7 @@ export class Store {
   private processedEvents = new Set<string>();
   private githubOauthStates = new Map<string, { discordUserId: string; expiresAt: Date }>();
   private githubConnections = new Map<string, GithubConnection>();
+  private githubPendingChanges = new Map<string, { discordUserId: string; payloadEncrypted: string; expiresAt: Date }>();
 
   async init() {
     if (!config.DATABASE_URL) {
@@ -121,8 +122,18 @@ export class Store {
         updated_at timestamptz not null default now()
       )
     `;
+    await this.sql`
+      create table if not exists github_pending_changes (
+        id text primary key,
+        discord_user_id text not null,
+        payload_encrypted text not null,
+        expires_at timestamptz not null,
+        created_at timestamptz not null default now()
+      )
+    `;
     await this.sql`delete from processed_events where processed_at < now() - interval '30 days'`;
     await this.sql`delete from github_oauth_states where expires_at < now()`;
+    await this.sql`delete from github_pending_changes where expires_at < now()`;
     const settings = await this.sql<{ key: string; value: string }[]>`select key, value from runtime_settings`;
     for (const item of settings) this.settings.set(item.key, item.value);
   }
@@ -258,6 +269,11 @@ export class Store {
     `;
   }
 
+  async deleteSetting(key: string) {
+    this.settings.delete(key);
+    if (this.sql) await this.sql`delete from runtime_settings where key = ${key}`;
+  }
+
   async claimEvent(discordMessageId: string): Promise<boolean> {
     if (!this.sql) {
       if (this.processedEvents.has(discordMessageId)) return false;
@@ -361,9 +377,61 @@ export class Store {
   async deleteGithubConnection(discordUserId: string) {
     if (!this.sql) {
       this.githubConnections.delete(discordUserId);
+      this.settings.delete(`github_repo:${discordUserId}`);
       return;
     }
-    await this.sql`delete from github_connections where discord_user_id = ${discordUserId}`;
+    await this.sql.begin(async (sql) => {
+      await sql`delete from github_connections where discord_user_id = ${discordUserId}`;
+      await sql`delete from github_pending_changes where discord_user_id = ${discordUserId}`;
+      await sql`delete from runtime_settings where key = ${`github_repo:${discordUserId}`}`;
+    });
+    this.settings.delete(`github_repo:${discordUserId}`);
+  }
+
+  async saveGithubPendingChange(id: string, discordUserId: string, payloadEncrypted: string, expiresAt: Date) {
+    if (!this.sql) {
+      this.githubPendingChanges.set(id, { discordUserId, payloadEncrypted, expiresAt });
+      return;
+    }
+    await this.sql`
+      insert into github_pending_changes (id, discord_user_id, payload_encrypted, expires_at)
+      values (${id}, ${discordUserId}, ${payloadEncrypted}, ${expiresAt})
+    `;
+  }
+
+  async consumeGithubPendingChange(id: string, discordUserId: string): Promise<string | null> {
+    if (!this.sql) {
+      const pending = this.githubPendingChanges.get(id);
+      this.githubPendingChanges.delete(id);
+      return pending && pending.discordUserId === discordUserId && pending.expiresAt > new Date() ? pending.payloadEncrypted : null;
+    }
+    const rows = await this.sql<{ payload_encrypted: string }[]>`
+      delete from github_pending_changes
+      where id = ${id} and discord_user_id = ${discordUserId} and expires_at > now()
+      returning payload_encrypted
+    `;
+    return rows[0]?.payload_encrypted ?? null;
+  }
+
+  async getGithubPendingChange(id: string, discordUserId: string): Promise<string | null> {
+    if (!this.sql) {
+      const pending = this.githubPendingChanges.get(id);
+      return pending && pending.discordUserId === discordUserId && pending.expiresAt > new Date() ? pending.payloadEncrypted : null;
+    }
+    const rows = await this.sql<{ payload_encrypted: string }[]>`
+      select payload_encrypted from github_pending_changes
+      where id = ${id} and discord_user_id = ${discordUserId} and expires_at > now()
+    `;
+    return rows[0]?.payload_encrypted ?? null;
+  }
+
+  async deleteGithubPendingChange(id: string, discordUserId: string) {
+    if (!this.sql) {
+      const pending = this.githubPendingChanges.get(id);
+      if (pending?.discordUserId === discordUserId) this.githubPendingChanges.delete(id);
+      return;
+    }
+    await this.sql`delete from github_pending_changes where id = ${id} and discord_user_id = ${discordUserId}`;
   }
 
   async healthCheck(): Promise<{ ok: boolean; mode: "postgres" | "memory"; latencyMs: number; error?: string }> {
