@@ -242,6 +242,16 @@ async function handleCommand(message: Message, store: Store) {
     await message.reply(`Состояние: **${(await store.isPaused()) ? "пауза" : "активно"}**\nЗапросов к моделям сегодня: **${await store.getRequestsToday()} / ${dailyLimit}**`);
     return;
   }
+  if (command === "tasks" || command === "задачи") {
+    const tasks = await store.listAgentTasks(message.channelId, 15);
+    if (!tasks.length) {
+      await message.reply("В этом канале агенты ещё не создавали подзадач.");
+      return;
+    }
+    const icon = { running: "⏳", done: "✅", failed: "❌", cancelled: "🛑" } as const;
+    await sendLong(message.channel as TextChannel, tasks.map((task) => `${icon[task.status]} **${task.requestedBy} → ${task.assignedTo}** · ID **${task.id.slice(0, 8)}**\n${task.description.slice(0, 300)}`).join("\n\n"));
+    return;
+  }
   if (command === "context" || command === "session") {
     if (!channelAgent) {
       await message.reply("Эта команда предназначена для персонального канала агента.");
@@ -305,7 +315,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "help") {
     await message.reply(
-      "Команды: `!discuss <тема>`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
+      "Команды: `!discuss <тема>`, `!tasks`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
     );
     return;
   }
@@ -624,14 +634,21 @@ async function executeAgentWorkflow(input: {
       content: `📨 **@${target.name}**, нужна помощь:\n> ${delegation.task}`,
       files: []
     });
-    const helperResult = await executeAgentWorkflow({
-      ...input,
-      agent: target,
-      task: `Запрос от агента «${agent.name}»: ${delegation.task}`,
-      depth: depth + 1,
-      requestedBy: configuredAgent
-    });
-    helperResults.push({ agent: target, result: helperResult });
+    const tracked = await store.createAgentTask({ channelId: message.channelId, requestedBy: agent.name, assignedTo: target.name, description: delegation.task });
+    try {
+      const helperResult = await executeAgentWorkflow({
+        ...input,
+        agent: target,
+        task: `Запрос от агента «${agent.name}»: ${delegation.task}`,
+        depth: depth + 1,
+        requestedBy: configuredAgent
+      });
+      helperResults.push({ agent: target, result: helperResult });
+      await store.finishAgentTask(tracked.id, "done", helperResult.content);
+    } catch (error) {
+      await store.finishAgentTask(tracked.id, signal.aborted ? "cancelled" : "failed", errorMessage(error));
+      throw error;
+    }
   }
 
   if (helperResults.length && !signal.aborted) {

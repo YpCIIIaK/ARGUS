@@ -32,6 +32,17 @@ export type GithubConnection = {
   refreshTokenExpiresAt: Date | null;
   updatedAt: Date;
 };
+export type AgentTask = {
+  id: string;
+  channelId: string;
+  requestedBy: string;
+  assignedTo: string;
+  description: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  result?: string;
+  createdAt: Date;
+  updatedAt: Date;
+};
 
 export class Store {
   private sql: Sql | null = null;
@@ -46,6 +57,7 @@ export class Store {
   private githubOauthStates = new Map<string, { discordUserId: string; expiresAt: Date }>();
   private githubConnections = new Map<string, GithubConnection>();
   private githubPendingChanges = new Map<string, { discordUserId: string; payloadEncrypted: string; expiresAt: Date }>();
+  private agentTasks = new Map<string, AgentTask>();
 
   async init() {
     if (!config.DATABASE_URL) {
@@ -129,6 +141,19 @@ export class Store {
         payload_encrypted text not null,
         expires_at timestamptz not null,
         created_at timestamptz not null default now()
+      )
+    `;
+    await this.sql`
+      create table if not exists agent_tasks (
+        id text primary key,
+        channel_id text not null,
+        requested_by text not null,
+        assigned_to text not null,
+        description text not null,
+        status text not null,
+        result text,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now()
       )
     `;
     await this.sql`delete from processed_events where processed_at < now() - interval '30 days'`;
@@ -432,6 +457,35 @@ export class Store {
       return;
     }
     await this.sql`delete from github_pending_changes where id = ${id} and discord_user_id = ${discordUserId}`;
+  }
+
+  async createAgentTask(input: Pick<AgentTask, "channelId" | "requestedBy" | "assignedTo" | "description">): Promise<AgentTask> {
+    const now = new Date();
+    const task: AgentTask = { id: crypto.randomUUID(), ...input, status: "running", createdAt: now, updatedAt: now };
+    if (!this.sql) this.agentTasks.set(task.id, task);
+    else await this.sql`
+      insert into agent_tasks (id, channel_id, requested_by, assigned_to, description, status)
+      values (${task.id}, ${task.channelId}, ${task.requestedBy}, ${task.assignedTo}, ${task.description}, ${task.status})
+    `;
+    return task;
+  }
+
+  async finishAgentTask(id: string, status: "done" | "failed" | "cancelled", result = "") {
+    if (!this.sql) {
+      const task = this.agentTasks.get(id);
+      if (task) this.agentTasks.set(id, { ...task, status, result: result.slice(0, 2000), updatedAt: new Date() });
+      return;
+    }
+    await this.sql`update agent_tasks set status = ${status}, result = ${result.slice(0, 2000)}, updated_at = now() where id = ${id}`;
+  }
+
+  async listAgentTasks(channelId: string, limit = 20): Promise<AgentTask[]> {
+    if (!this.sql) return [...this.agentTasks.values()].filter((task) => task.channelId === channelId).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, limit);
+    const rows = await this.sql<{ id: string; channel_id: string; requested_by: string; assigned_to: string; description: string; status: AgentTask["status"]; result: string | null; created_at: Date; updated_at: Date }[]>`
+      select * from agent_tasks where channel_id = ${channelId} order by created_at desc limit ${limit}
+    `;
+    return rows.map((row) => ({ id: row.id, channelId: row.channel_id, requestedBy: row.requested_by, assignedTo: row.assigned_to,
+      description: row.description, status: row.status, ...(row.result ? { result: row.result } : {}), createdAt: row.created_at, updatedAt: row.updated_at }));
   }
 
   async healthCheck(): Promise<{ ok: boolean; mode: "postgres" | "memory"; latencyMs: number; error?: string }> {
