@@ -22,6 +22,7 @@ type GithubInstallation = { id: number; account?: { login?: string }; repository
 type GithubRepository = { id: number; full_name: string; private: boolean; html_url: string; default_branch: string };
 type GithubPullFile = { filename?: string; status?: string; additions?: number; deletions?: number; patch?: string };
 type GithubCheckRun = { name?: string; status?: string; conclusion?: string | null; details_url?: string };
+type GithubTreeEntry = { path?: string; mode?: string; type?: "blob" | "tree" | "commit"; sha?: string; size?: number };
 
 export type GithubRepo = GithubRepository & { installationId: number; account: string; selection: string; contentsPermission: string; pullRequestsPermission: string };
 export type GithubPullReviewContext = {
@@ -34,6 +35,13 @@ export type GithubPullReviewContext = {
   files: GithubPullFile[];
   checks: GithubCheckRun[];
   checksError?: string;
+};
+export type GithubRepositorySnapshot = {
+  repo: string;
+  ref: string;
+  files: Array<{ path: string; content: Uint8Array }>;
+  totalBytes: number;
+  skippedSensitiveFiles: number;
 };
 type PendingGithubChange = { repo: string; changes: GithubFileChange[]; requestedAt: string; emptyRepository: boolean };
 class GithubApiError extends Error {
@@ -363,6 +371,55 @@ export function formatGithubChecks(context: GithubPullReviewContext): string {
   }).join("\n");
 }
 
+export async function readGithubRepositorySnapshot(
+  store: Store,
+  discordUserId: string,
+  repoName: string,
+  ref?: string
+): Promise<GithubRepositorySnapshot> {
+  if (selectedGithubRepository(store, discordUserId) !== repoName) throw new Error("Этот репозиторий больше не выбран как рабочий.");
+  const repositories = await listGithubRepositories(store, discordUserId);
+  const repository = repositories.find((item) => item.full_name === repoName);
+  if (!repository) throw new Error("Репозиторий больше недоступен GitHub App.");
+  const connection = await requireConnection(store, discordUserId);
+  const token = await validAccessToken(store, connection);
+  const [owner, repo] = repoName.split("/");
+  if (!owner || !repo) throw new Error("Некорректное имя репозитория.");
+  const root = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const requestedRef = ref || repository.default_branch;
+  const tree = await githubRequest<{ tree?: GithubTreeEntry[]; truncated?: boolean }>(
+    `${root}/git/trees/${encodeURIComponent(requestedRef)}?recursive=1`,
+    token
+  );
+  if (tree.truncated) throw new Error("Дерево репозитория слишком велико для безопасной загрузки в песочницу.");
+  const allBlobs = (tree.tree ?? []).filter((entry) => entry.type === "blob" && entry.sha && entry.path);
+  const blobs = allBlobs.filter((entry) => !isSensitiveSnapshotPath(entry.path!));
+  if (!blobs.length) throw new Error("В выбранной ветке нет файлов.");
+  if (blobs.length > 750) throw new Error(`В репозитории ${blobs.length} файлов — лимит песочницы 750.`);
+  const declaredBytes = blobs.reduce((sum, entry) => sum + (entry.size || 0), 0);
+  if (declaredBytes > 20_000_000) throw new Error("Размер репозитория превышает лимит песочницы 20 МБ.");
+
+  const files: GithubRepositorySnapshot["files"] = [];
+  let totalBytes = 0;
+  for (let offset = 0; offset < blobs.length; offset += 10) {
+    const batch = blobs.slice(offset, offset + 10);
+    const loaded = await Promise.all(batch.map(async (entry) => {
+      const path = safeSnapshotPath(entry.path!);
+      const blob = await githubRequest<{ encoding?: string; content?: string; size?: number }>(`${root}/git/blobs/${entry.sha}`, token);
+      if (blob.encoding !== "base64" || typeof blob.content !== "string") throw new Error(`GitHub не вернул содержимое ${path}.`);
+      const content = Buffer.from(blob.content.replace(/\s/g, ""), "base64");
+      if (content.length > 5_000_000) throw new Error(`Файл ${path} превышает лимит 5 МБ.`);
+      return { path, content };
+    }));
+    for (const file of loaded) {
+      totalBytes += file.content.length;
+      if (totalBytes > 20_000_000) throw new Error("Размер репозитория превышает лимит песочницы 20 МБ.");
+      files.push(file);
+    }
+  }
+  return { repo: repoName, ref: requestedRef, files, totalBytes, skippedSensitiveFiles: allBlobs.length - blobs.length };
+}
+
 export async function disconnectGithub(store: Store, discordUserId: string): Promise<{ login: string; revoked: boolean }> {
   ensureConfigured();
   const connection = await requireConnection(store, discordUserId);
@@ -483,6 +540,22 @@ async function githubDefaultBranchSha(root: string, defaultBranch: string, token
 
 function encodeRepositoryPath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
+}
+
+function safeSnapshotPath(value: string): string {
+  const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!normalized || normalized.startsWith("/") || normalized.split("/").some((part) => !part || part === "." || part === "..")) {
+    throw new Error("GitHub вернул небезопасный путь файла.");
+  }
+  return normalized;
+}
+
+function isSensitiveSnapshotPath(value: string): boolean {
+  const path = value.replace(/\\/g, "/").toLowerCase();
+  const name = path.split("/").at(-1) || "";
+  return name === ".env" || /^\.env\.(?!example$|sample$)/.test(name) ||
+    [".npmrc", ".pypirc", ".git-credentials", "id_rsa", "id_ed25519"].includes(name) ||
+    name.endsWith(".pem") || name.endsWith(".key") || name.endsWith(".p12") || name.endsWith(".pfx");
 }
 
 function githubPullRequestTitle(changes: GithubFileChange[]): string {

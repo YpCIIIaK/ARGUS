@@ -46,6 +46,11 @@ test("approved GitHub changes create a branch and draft pull request", async () 
     if (url.endsWith("/pulls/12") && method === "GET") return json({ number: 12, html_url: "https://github.com/octocat/demo/pull/12", title: "Update README", body: "Test PR", head: { sha: "head-sha" } });
     if (url.endsWith("/pulls/12/files?per_page=100")) return json([{ filename: "README.md", status: "modified", additions: 1, deletions: 1, patch: "@@ -1 +1 @@" }]);
     if (url.endsWith("/commits/head-sha/check-runs?per_page=100")) return json({ check_runs: [{ name: "tests", status: "completed", conclusion: "success" }] });
+    if (url.endsWith("/git/trees/head-sha?recursive=1")) return json({ tree: [
+      { path: "package.json", type: "blob", sha: "blob-1", size: 20 },
+      { path: ".env", type: "blob", sha: "secret-blob", size: 20 }
+    ] });
+    if (url.endsWith("/git/blobs/blob-1")) return json({ encoding: "base64", content: Buffer.from('{"scripts":{}}').toString("base64"), size: 14 });
     return json({ message: `Unhandled test request: ${method} ${url}` }, 500);
   };
 
@@ -79,6 +84,12 @@ test("approved GitHub changes create a branch and draft pull request", async () 
     });
     assert.match(formatted, /✅ \*\*tests\*\*/);
     assert.match(formatted, /⏳ \*\*lint\*\*/);
+    const snapshot = await github.readGithubRepositorySnapshot(store, userId, "octocat/demo", "head-sha");
+    assert.equal(snapshot.ref, "head-sha");
+    assert.equal(snapshot.files[0]?.path, "package.json");
+    assert.equal(snapshot.skippedSensitiveFiles, 1);
+    assert.equal(requests.some((request) => request.url.endsWith("/git/blobs/secret-blob")), false);
+    assert.match(Buffer.from(snapshot.files[0]!.content).toString("utf8"), /scripts/);
   } finally {
     globalThis.fetch = originalFetch;
   }

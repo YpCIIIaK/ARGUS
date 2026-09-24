@@ -33,13 +33,14 @@ import {
   listGithubRepositories,
   prepareGithubFileChanges,
   previewGithubFileChanges,
+  readGithubRepositorySnapshot,
   readSelectedGithubFiles,
   readGithubPullRequestContext,
   selectGithubRepository,
   selectedGithubRepository
 } from "./github.js";
 import { askAgent } from "./openrouter.js";
-import { runSandboxSmokeTest, sandboxIsConfigured, sandboxStatus } from "./sandbox.js";
+import { runRepositorySandbox, runSandboxSmokeTest, sandboxIsConfigured, sandboxStatus, type SandboxRunResult } from "./sandbox.js";
 import { Store } from "./store.js";
 import { executeWebActions, webToolsConfigured } from "./web-tools.js";
 
@@ -47,6 +48,7 @@ const commandPrefix = "!";
 const webhookCache = new Map<string, WebhookClient>();
 const channelQueues = new Map<string, Promise<void>>();
 const activeRuns = new Map<string, AbortController>();
+const sandboxRuns = new Map<string, { repo: string; ref: string; result?: SandboxRunResult; error?: string; startedAt: Date }>();
 const maxDelegationsPerRun = 5;
 const maxDelegationDepth = 3;
 
@@ -76,13 +78,13 @@ export function createDiscordClient(store: Store) {
       console.error("Failed to claim Discord event", error);
       return;
     }
-    if (message.content.trim().toLowerCase() === "!stop") {
+    if (["!stop", "!sandbox stop"].includes(message.content.trim().toLowerCase())) {
       const active = activeRuns.get(message.channelId);
       if (!active) {
-        await message.reply("В этом канале сейчас нет активной генерации.");
+        await message.reply("В этом канале сейчас нет активной задачи.");
       } else {
         active.abort(new Error("Stopped by user"));
-        await message.reply("Останавливаю текущую генерацию…");
+        await message.reply("Останавливаю текущую задачу…");
       }
       return;
     }
@@ -180,8 +182,15 @@ async function handleCommand(message: Message, store: Store) {
       }
       return;
     }
-    if (action !== "test") {
-      await message.reply("Используй `!sandbox status` или `!sandbox test`.");
+    if (action === "logs") {
+      const last = sandboxRuns.get(message.channelId);
+      if (!last) await message.reply("В этом канале ещё не запускали проверку репозитория.");
+      else if (last.result) await sendLong(message.channel as TextChannel, formatSandboxResult(last.repo, last.ref, last.result));
+      else await message.reply(`Последний запуск **${last.repo}@${last.ref}**: ${last.error ? `❌ ${last.error}` : "⏳ выполняется"}`);
+      return;
+    }
+    if (!['test', 'run'].includes(action)) {
+      await message.reply("Используй `!sandbox status`, `!sandbox test`, `!sandbox run [pr <номер>]`, `!sandbox logs` или `!sandbox stop`.");
       return;
     }
     if (!sandboxIsConfigured()) {
@@ -192,8 +201,22 @@ async function handleCommand(message: Message, store: Store) {
       await message.reply("Запуск платной вычислительной среды доступен владельцам и администраторам сервера.");
       return;
     }
+    if (activeRuns.has(message.channelId)) {
+      await message.reply("В этом канале уже выполняется задача. Используй `!stop`, если её нужно остановить.");
+      return;
+    }
     const controller = new AbortController();
     activeRuns.set(message.channelId, controller);
+    if (action === "run") {
+      try {
+        await runSelectedRepositorySandbox(message, store, rest.slice(1), controller);
+      } catch (error) {
+        await message.reply(`Не удалось запустить проверку репозитория: ${errorMessage(error)}`);
+      } finally {
+        if (activeRuns.get(message.channelId) === controller) activeRuns.delete(message.channelId);
+      }
+      return;
+    }
     await sendAsAgent(message.channel as TextChannel, runtimeAgent(store, agents[0]!), "Передаю небольшой проверочный файл в изолированную CodeSandbox VM и прошу выполнить его.");
     await message.reply("🧪 **Песочница:** создаю временную приватную VM…");
     try {
@@ -282,7 +305,7 @@ async function handleCommand(message: Message, store: Store) {
   }
   if (command === "help") {
     await message.reply(
-      "Команды: `!discuss <тема>`, `!stop`, `!sandbox status`, `!sandbox test`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
+      "Команды: `!discuss <тема>`, `!stop`, `!sandbox status`, `!sandbox test`, `!sandbox run`, `!sandbox run pr <номер>`, `!sandbox logs`, `!sandbox stop`, `!bounty`, `!bounty <вопрос>`, `!bounty status`, `!bounty scan`, `!github connect`, `!github repos`, `!github disconnect`, `!agents`, `!settings`, `!status`, `!context`, `!model`, `!compact`, `!clear`, `!pause`, `!resume`."
     );
     return;
   }
@@ -378,6 +401,63 @@ async function handleGithubCommand(message: Message, store: Store, args: string[
     components: [row],
     allowedMentions: { parse: [] }
   });
+}
+
+async function runSelectedRepositorySandbox(message: Message, store: Store, args: string[], controller: AbortController) {
+  const repo = selectedGithubRepository(store, message.author.id);
+  if (!repo) {
+    await message.reply("Сначала выбери рабочий репозиторий через `!github` → «Репозитории».");
+    return;
+  }
+  let ref: string | undefined;
+  let label = "основная ветка";
+  if (args[0]?.toLowerCase() === "pr") {
+    const pullNumber = Number(args[1]);
+    if (!Number.isInteger(pullNumber) || pullNumber < 1) {
+      await message.reply("Укажи номер: `!sandbox run pr 12`.");
+      return;
+    }
+    const pull = await readGithubPullRequestContext(store, message.author.id, repo, pullNumber);
+    ref = pull.headSha;
+    label = `PR #${pull.number}`;
+  } else if (args.length) {
+    await message.reply("Используй `!sandbox run` или `!sandbox run pr <номер>`.");
+    return;
+  }
+  const channel = message.channel as TextChannel;
+  sandboxRuns.set(message.channelId, { repo, ref: ref || "default", startedAt: new Date() });
+  await sendAsAgent(channel, runtimeAgent(store, agents[0]!), `Передаю ${label} репозитория **${repo}** в изолированную песочницу. GitHub-токен и секреты проекта в VM не передаются.`);
+  try {
+    await message.reply(`📦 **GitHub → Песочница:** загружаю ${label} и определяю команды проекта…`);
+    const snapshot = await readGithubRepositorySnapshot(store, message.author.id, repo, ref);
+    await message.reply(`🧪 **Песочница:** получено **${snapshot.files.length}** файлов (${formatBytes(snapshot.totalBytes)}).${snapshot.skippedSensitiveFiles ? ` Пропущено потенциально секретных файлов: **${snapshot.skippedSensitiveFiles}**.` : ""} Создаю временную приватную VM.`);
+    const result = await runRepositorySandbox(snapshot, controller.signal, async (event) => {
+      if (event.type === "started") await channel.send(`▶️ **Песочница выполняет:** ${event.command}`);
+      else await channel.send(`${event.ok ? "✅" : "❌"} **Песочница завершила:** ${event.command} за **${((event.durationMs || 0) / 1000).toFixed(1)} с**\n\`\`\`text\n${safeLog(event.output || "(вывод пуст)")}\n\`\`\``);
+    });
+    sandboxRuns.set(message.channelId, { repo, ref: snapshot.ref, result, startedAt: new Date() });
+    const ok = result.steps.every((step) => step.ok);
+    await sendAsAgent(channel, runtimeAgent(store, agents[1]!), ok
+      ? `Проверил полный запуск **${repo}@${snapshot.ref}**: все **${result.steps.length}** этапа(ов) прошли. Временная VM остановлена.`
+      : `Проверил запуск **${repo}@${snapshot.ref}**: команда **${result.steps.find((step) => !step.ok)?.command || "unknown"}** завершилась ошибкой. Передаю лог Программисту для исправления.`);
+  } catch (error) {
+    const text = controller.signal.aborted ? "Операция остановлена командой пользователя." : errorMessage(error);
+    sandboxRuns.set(message.channelId, { repo, ref: ref || "default", error: text, startedAt: new Date() });
+    await message.reply(controller.signal.aborted ? "🛑 Выполнение в песочнице остановлено." : `Не удалось проверить репозиторий: ${text}`);
+  }
+}
+
+function formatSandboxResult(repo: string, ref: string, result: SandboxRunResult) {
+  const steps = result.steps.map((step) => `${step.ok ? "✅" : "❌"} ${step.command} · ${(step.durationMs / 1000).toFixed(1)} с\n${safeLog(step.output)}`).join("\n\n");
+  return `**Последний запуск песочницы**\nРепозиторий: **${repo}**\nRef: **${ref}**\nОбщее время: **${(result.durationMs / 1000).toFixed(1)} с**\n\n${steps}`;
+}
+
+function safeLog(value: string) {
+  return value.replace(/```/g, "''' ").slice(-1_400);
+}
+
+function formatBytes(value: number) {
+  return value < 1_000_000 ? `${(value / 1_000).toFixed(1)} КБ` : `${(value / 1_000_000).toFixed(1)} МБ`;
 }
 
 function isController(message: Message) {
@@ -944,11 +1024,34 @@ async function runPullRequestAgentReview(channel: TextChannel, store: Store, use
   };
   const context = await readGithubPullRequestContext(store, userId, repo, pullNumber);
   const checks = formatGithubChecks(context);
+  let sandboxSummary = "CodeSandbox не настроен — автоматическая проверка кода не запускалась.";
+  if (sandboxIsConfigured()) {
+    const controller = new AbortController();
+    activeRuns.set(channel.id, controller);
+    await publish(runtimeAgent(store, agents.find((item) => item.id === "programmer")!), `📤 Передаю код PR #${context.number} в CodeSandbox перед архитектурной проверкой.`);
+    try {
+      const snapshot = await readGithubRepositorySnapshot(store, userId, repo, context.headSha);
+      await channel.send(`🧪 **Песочница:** загружено **${snapshot.files.length}** файлов (${formatBytes(snapshot.totalBytes)}).${snapshot.skippedSensitiveFiles ? ` Потенциально секретных файлов пропущено: **${snapshot.skippedSensitiveFiles}**.` : ""}`);
+      const result = await runRepositorySandbox(snapshot, controller.signal, async (event) => {
+        if (event.type === "started") await channel.send(`▶️ **Песочница выполняет:** ${event.command}`);
+        else await channel.send(`${event.ok ? "✅" : "❌"} **Песочница завершила:** ${event.command} за **${((event.durationMs || 0) / 1000).toFixed(1)} с**\n\`\`\`text\n${safeLog(event.output || "(вывод пуст)")}\n\`\`\``);
+      });
+      sandboxRuns.set(channel.id, { repo, ref: context.headSha, result, startedAt: new Date() });
+      sandboxSummary = result.steps.map((step) => `${step.ok ? "PASS" : "FAIL"}: ${step.command}\n${safeLog(step.output)}`).join("\n\n");
+      await publish(runtimeAgent(store, agents.find((item) => item.id === "engineer")!), `📥 Получил результаты CodeSandbox по PR #${context.number}. VM остановлена; учитываю их в проверке архитектуры.`);
+    } catch (error) {
+      sandboxSummary = `Проверка CodeSandbox не завершена: ${errorMessage(error)}`;
+      sandboxRuns.set(channel.id, { repo, ref: context.headSha, error: errorMessage(error), startedAt: new Date() });
+      await channel.send(`⚠️ ${sandboxSummary} Агентская проверка PR продолжится с доступными данными.`);
+    } finally {
+      if (activeRuns.get(channel.id) === controller) activeRuns.delete(channel.id);
+    }
+  }
   const files = context.files.map((file) => [
     `--- ${file.filename || "unknown"} · ${file.status || "changed"} (+${file.additions ?? 0}/-${file.deletions ?? 0}) ---`,
     file.patch || "[GitHub не предоставил patch: файл может быть бинарным или diff слишком велик]"
   ].join("\n")).join("\n\n").slice(0, 80_000);
-  const base = `Репозиторий: ${context.repo}\nPull Request: #${context.number} — ${context.title}\nОписание:\n${context.body || "Нет описания"}\n\nПроверки GitHub:\n${checks}\n\nИзменённые файлы:\n${files}`;
+  const base = `Репозиторий: ${context.repo}\nPull Request: #${context.number} — ${context.title}\nОписание:\n${context.body || "Нет описания"}\n\nПроверки GitHub:\n${checks}\n\nРезультат CodeSandbox:\n${sandboxSummary}\n\nИзменённые файлы:\n${files}`;
   const programmer = agents.find((item) => item.id === "programmer")!;
   await publish(runtimeAgent(store, programmer), `✅ Создал черновик [Pull Request #${context.number}](<${context.url}>). Передаю изменения Инженеру и Исследователю на проверку.`);
   await channel.send({ content: `🔍 **Начинается публичная проверка [PR #${context.number}](<${context.url}>) агентами.**\n${checks}`, allowedMentions: { parse: [] } });
@@ -1211,6 +1314,10 @@ export function splitDiscordMessage(content: string, limit = 1900): string[] {
   }
   if (remaining) parts.push(remaining);
   return parts;
+}
+
+async function sendLong(channel: TextChannel, content: string) {
+  for (const part of splitDiscordMessage(content)) await channel.send({ content: part, allowedMentions: { parse: [] } });
 }
 
 async function sendAsAgent(channel: TextChannel, agent: Agent, content: string): Promise<{ id: string }> {
